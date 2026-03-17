@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Data and checkpoints (large files)
+jepa_raw_data/
+jepa_final_dataset/
+jepa_checkpoints/
+energy_head_checkpoints/
+jepa_logs/*.mp4
+jepa_logs/*.csv
+energy_head_logs/
+verification_videos/
+
+# Generated textures
+textures/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
