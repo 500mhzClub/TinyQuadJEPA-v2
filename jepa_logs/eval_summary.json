@@ -1,0 +1,66 @@
+{
+  "route": [
+    1,
+    2,
+    3,
+    2,
+    1
+  ],
+  "route_complete": true,
+  "route_ptr": 4,
+  "total_steps": 2298,
+  "max_steps": 3000,
+  "n_candidates": 512,
+  "horizon": 15,
+  "dist_thresh": 0.45,
+  "with_obstacles": false,
+  "elapsed_sec": 194.78,
+  "visit_counts": {
+    "W1": 2,
+    "W2": 2,
+    "W3": 1
+  },
+  "arrivals": [
+    {
+      "route_idx": 0,
+      "waypoint": 0,
+      "step": 899,
+      "dist": 0.44736137986183167,
+      "ema_energy": 3.94221556089757
+    },
+    {
+      "route_idx": 1,
+      "waypoint": 1,
+      "step": 1371,
+      "dist": 0.4451107680797577,
+      "ema_energy": 1.8858256307419434
+    },
+    {
+      "route_idx": 2,
+      "waypoint": 2,
+      "step": 1667,
+      "dist": 0.4424600303173065,
+      "ema_energy": 4.000858738244319
+    },
+    {
+      "route_idx": 3,
+      "waypoint": 1,
+      "step": 1965,
+      "dist": 0.44453105330467224,
+      "ema_energy": 0.08334704027216133
+    },
+    {
+      "route_idx": 4,
+      "waypoint": 0,
+      "step": 2297,
+      "dist": 0.44787609577178955,
+      "ema_energy": 3.9689239479168963
+    }
+  ],
+  "final_ema_energy": 3.9689,
+  "checkpoints": {
+    "jepa": "jepa_checkpoints/epoch_17.pt",
+    "head": "energy_head_checkpoints/energy_head_best.pt",
+    "ppo": "models/ppo/ckpt_20000.pt"
+  }
+}

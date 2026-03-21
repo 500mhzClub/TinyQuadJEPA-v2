@@ -9,7 +9,7 @@ Successor to [TinyQuadJEPA v1](../TinyQuadJEPA/), which demonstrated that VICReg
 | | v1 | v2 |
 |---|---|---|
 | **Architecture** | Single encoder + VICReg (sim+var+cov) | Student-teacher with EMA target encoder + MSE |
-| **Training data** | Flat plane, single checkerboard texture | Random obstacles, 10 ground textures, random obstacle colors |
+| **Training data** | Flat plane, single checkerboard texture | Boxes + wall structures, 27 ground textures, random obstacle colors |
 | **Collapse prevention** | VICReg variance/covariance terms | EMA asymmetry (proven by BYOL, DINO, I-JEPA) |
 | **Collision handling** | None (never saw obstacles) | AABB detection per step, reset + mask in training |
 | **Code structure** | Model classes duplicated across 8 files | Shared `tqjepa/` Python package |
@@ -49,9 +49,9 @@ Inference (MPC / energy head):
 
 ### Training data with obstacles
 
-Physics rollout generates random box obstacles (3-8 per scene, varying size and position). Each chunk gets a different layout; all envs within a chunk share the layout (Genesis constraint). Collision detection resets the robot when it clips into obstacles, and collision frames are masked during JEPA training.
+Physics rollout now mixes free-standing boxes with long wall segments, corridors, L-shapes, dead ends, and optional perimeter walls. Each chunk gets a different layout; all envs within a chunk share the layout (Genesis constraint). Collision detection resets the robot when it clips into obstacles, and collision frames are masked during JEPA training.
 
-Visual rendering applies diverse ground textures (checkerboards, stripes, noise, solids) with per-frame domain randomization (brightness, contrast, noise, hue shift).
+Visual rendering applies a larger procedural texture bank spanning checkerboards, stripes, gradients, fractal noise, tile, concrete, wood, carpet, grass, gravel, and sand. Workers keep several textured scene variants alive so texture choice changes across environments, then add per-frame domain randomization (brightness, contrast, noise, hue shift).
 
 ## Runbook
 
@@ -208,7 +208,7 @@ hardware/README.md             Hardware build guide
 
 **Collision handling strategy:** AABB detection with 0.15m margin resets the robot before the camera clips inside obstacles. Collision frames in the dataset are masked during training so the predictor never learns from physically impossible transitions.
 
-**Texture randomization rationale:** The v1 model overfits to a single checkerboard. Diverse textures force the visual encoder to learn structural features (edges, depth cues) rather than texture-specific patterns.
+**Texture randomization rationale:** The v1 model overfits to a single checkerboard. A broader texture bank with per-environment variation forces the visual encoder to learn structural features (edges, depth cues) rather than texture-specific patterns.
 
 ## Collapse monitoring
 

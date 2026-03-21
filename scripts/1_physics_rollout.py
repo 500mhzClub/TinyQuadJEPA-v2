@@ -18,12 +18,17 @@ Output: one .npz per chunk in --out_dir, each containing:
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import os
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 import numpy as np
 import torch
@@ -58,6 +63,7 @@ Q0_VALUES = [
 
 URDF_PATH = "assets/mini_pupper/mini_pupper.urdf"
 ROBOT_SPAWN = (0.0, 0.0, 0.12)
+DEFAULT_SCENE_BATCH_ENVS = 32768
 
 # --------------------------------------------------------------------------- #
 # Simulation config
@@ -149,6 +155,15 @@ def sample_safe_positions(
     return positions
 
 
+def load_frozen_policy(ckpt_path: str) -> ActorCritic:
+    """Load the PPO actor-critic onto the current Genesis torch device."""
+    model = ActorCritic(obs_dim=50, act_dim=12).to(gs.device)
+    ppo_sd = load_ppo_checkpoint(ckpt_path, device=gs.device)
+    model.load_state_dict(ppo_sd, strict=False)
+    model.eval()
+    return model
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -171,7 +186,17 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42,
                         help="Base random seed.")
     parser.add_argument("--sim_backend", type=str, default="auto",
-                        help="Genesis backend: auto | gpu | cuda | cpu.")
+                        help="Genesis backend: auto | gpu | cuda | vulkan | metal | cpu.")
+    parser.add_argument(
+        "--scene_batch_envs",
+        type=int,
+        default=DEFAULT_SCENE_BATCH_ENVS,
+        help=(
+            "Maximum envs per Genesis scene build. Larger logical chunks are "
+            "split across multiple scene batches to avoid solver size limits. "
+            "Set to 0 to disable batching."
+        ),
+    )
     args = parser.parse_args()
 
     # Validate checkpoint exists.
@@ -183,23 +208,17 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = SimConfig(n_envs=args.n_envs)
+    scene_batch_envs = cfg.n_envs if args.scene_batch_envs <= 0 else min(args.scene_batch_envs, cfg.n_envs)
+    n_scene_batches = math.ceil(cfg.n_envs / scene_batch_envs)
 
     # ---- reproducibility -------------------------------------------------- #
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    # ---- Genesis init ----------------------------------------------------- #
-    init_genesis_once(args.sim_backend)
-
-    # Load the frozen PPO policy.
-    model = ActorCritic(obs_dim=50, act_dim=12).to(gs.device)
-    ppo_sd = load_ppo_checkpoint(args.ckpt, device=gs.device)
-    model.load_state_dict(ppo_sd, strict=False)
-    model.eval()
-
     print(f"\nPhysics rollout configuration:")
     print(f"  Checkpoint : {args.ckpt}")
     print(f"  Envs       : {cfg.n_envs}")
+    print(f"  Scene batch: {scene_batch_envs} ({n_scene_batches} scene(s)/chunk)")
     print(f"  Steps/chunk: {args.steps}")
     print(f"  Chunks     : {args.chunks}")
     print(f"  Output     : {out_dir.resolve()}")
@@ -217,37 +236,7 @@ def main() -> None:
         layout = generate_random_layout(seed=chunk_seed)
         print(f"  Obstacles: {len(layout.obstacles)}")
 
-        # Build scene.
-        scene = gs.Scene(show_viewer=False)
-        scene.add_entity(gs.morphs.Plane())
-        robot = scene.add_entity(
-            gs.morphs.URDF(file=URDF_PATH, pos=ROBOT_SPAWN, fixed=False)
-        )
-        add_obstacles_to_scene(scene, layout)
-        scene.build(n_envs=cfg.n_envs)
-
-        # ---- Joint indexing ----------------------------------------------- #
-        name_to_joint = {j.name: j for j in robot.joints}
-        missing = [jn for jn in JOINTS_ACTUATED if jn not in name_to_joint]
-        if missing:
-            print(f"ERROR: missing joints in URDF: {missing}")
-            sys.exit(1)
-
-        dof_idx = [list(name_to_joint[jn].dofs_idx_local)[0]
-                    for jn in JOINTS_ACTUATED]
-        act_dofs = torch.tensor(dof_idx, device=gs.device, dtype=torch.int64)
-
-        q0 = torch.tensor(Q0_VALUES, device=gs.device, dtype=torch.float32)
-
-        robot.set_dofs_kp(torch.ones(12, device=gs.device) * cfg.kp, act_dofs)
-        robot.set_dofs_kv(torch.ones(12, device=gs.device) * cfg.kv, act_dofs)
-
         # ---- Per-chunk state ---------------------------------------------- #
-        ou_noise = OUNoiseBatched(cfg.n_envs, 3, gs.device)
-        latency_buffer = torch.zeros((2, cfg.n_envs, 3), device=gs.device)
-        prev_a = torch.zeros((cfg.n_envs, 12), device=gs.device)
-
-        # ---- Allocate data buffers on CPU --------------------------------- #
         d_proprio   = torch.zeros((cfg.n_envs, args.steps, 47), dtype=torch.float32, device="cpu")
         d_cmds      = torch.zeros((cfg.n_envs, args.steps, 3),  dtype=torch.float32, device="cpu")
         d_dones     = torch.zeros((cfg.n_envs, args.steps),      dtype=torch.bool,    device="cpu")
@@ -258,132 +247,176 @@ def main() -> None:
 
         t0 = time.time()
         total_resets = 0
+        model = None
+        try:
+            # Genesis/Vulkan can hold onto large solver allocations even after a
+            # scene is destroyed, so use a fresh runtime for every chunk.
+            init_genesis_once(args.sim_backend)
+            model = load_frozen_policy(args.ckpt)
 
-        for step in range(args.steps):
-            # -- Command generation (OU noise -> tanh -> scale) ------------- #
-            raw_cmds = torch.tanh(ou_noise.step())
-            scaled_cmds = raw_cmds.clone()
-            scaled_cmds[:, 0] *= 0.40   # vx
-            scaled_cmds[:, 1] *= 0.25   # vy
-            scaled_cmds[:, 2] *= 0.60   # wz
+            for batch_idx, env_start in enumerate(range(0, cfg.n_envs, scene_batch_envs)):
+                env_end = min(env_start + scene_batch_envs, cfg.n_envs)
+                batch_n_envs = env_end - env_start
+                batch_slice = slice(env_start, env_end)
 
-            # Two-step command latency buffer.
-            latency_buffer = torch.roll(latency_buffer, shifts=-1, dims=0)
-            latency_buffer[-1] = scaled_cmds
-            active_cmds = latency_buffer[0]
-
-            # -- Read robot state ------------------------------------------- #
-            pos  = robot.get_pos()          # (N, 3)
-            quat = robot.get_quat()         # (N, 4) wxyz
-            vel_b = world_to_body_vec(quat, robot.get_vel())
-            ang_b = world_to_body_vec(quat, robot.get_ang())
-            q  = robot.get_dofs_position(act_dofs)
-            dq = robot.get_dofs_velocity(act_dofs)
-            q_rel = q - q0.unsqueeze(0)
-
-            # 47-dim proprio: [height(1), quat(4), vel_body(3), ang_body(3),
-            #                   q_rel(12), dq(12), prev_action(12)]
-            proprio = torch.cat(
-                [pos[:, 2:3], quat, vel_b, ang_b, q_rel, dq, prev_a], dim=1
-            )
-
-            # -- Synthetic sensor noise ------------------------------------- #
-            noise = torch.randn_like(proprio) * 0.01
-            noise[:, 1:5]  *= 2.0    # quaternion noise x2
-            noise[:, 5:11] *= 5.0    # velocity corruption x5
-            proprio_noisy = proprio + noise
-
-            # -- Forward pass through frozen policy ------------------------- #
-            obs = torch.cat([proprio_noisy, active_cmds], dim=1)   # (N, 50)
-            actions = model.act_deterministic(obs)
-            prev_a = actions.clone()
-
-            # -- Compute joint targets and step physics --------------------- #
-            q_tgt = q0.unsqueeze(0) + cfg.action_scale * actions
-            q_tgt[:, 0:4]  = torch.clamp(q_tgt[:, 0:4],  -0.8, 0.8)
-            q_tgt[:, 4:8]  = torch.clamp(q_tgt[:, 4:8],  -1.5, 1.5)
-            q_tgt[:, 8:12] = torch.clamp(q_tgt[:, 8:12], -2.5, -0.5)
-
-            robot.control_dofs_position(q_tgt, act_dofs)
-            for _ in range(cfg.decimation):
-                scene.step()
-
-            # -- Termination: falls ----------------------------------------- #
-            z = pos[:, 2]
-            fallen = z < cfg.min_z
-
-            # -- Termination: collisions ------------------------------------ #
-            colliding = detect_collisions(
-                pos[:, :2], layout, margin=cfg.collision_margin
-            )
-
-            done = fallen | colliding
-
-            # -- Reset environments that are done --------------------------- #
-            done_ids = torch.nonzero(done).squeeze(-1)
-            if done_ids.numel() > 0:
-                total_resets += done_ids.numel()
-
-                # Reset OU noise for done envs.
-                ou_noise.reset(done_ids)
-
-                # Reset previous actions.
-                prev_a[done_ids] = 0.0
-
-                # Reset joint positions and velocities.
-                n_reset = done_ids.numel()
-                robot.set_dofs_position(
-                    q0.unsqueeze(0).expand(n_reset, -1), act_dofs, envs_idx=done_ids
-                )
-                robot.set_dofs_velocity(
-                    torch.zeros((n_reset, 12), device=gs.device), act_dofs, envs_idx=done_ids
+                print(
+                    f"  Scene batch {batch_idx + 1}/{n_scene_batches}: "
+                    f"envs {env_start}-{env_end - 1} ({batch_n_envs})"
                 )
 
-                # Sample safe respawn positions away from obstacles.
-                safe_xy = sample_safe_positions(
-                    n_reset, layout,
-                    clearance=cfg.safe_clearance,
-                    device=gs.device,
-                )
+                scene = None
+                try:
+                    # Build a manageable Genesis scene for this env slice.
+                    scene = gs.Scene(show_viewer=False)
+                    scene.add_entity(gs.morphs.Plane())
+                    robot = scene.add_entity(
+                        gs.morphs.URDF(file=URDF_PATH, pos=ROBOT_SPAWN, fixed=False)
+                    )
+                    add_obstacles_to_scene(scene, layout)
+                    scene.build(n_envs=batch_n_envs)
 
-                # Build full (x, y, z) respawn position.
-                respawn_pos = torch.zeros((n_reset, 3), device=gs.device)
-                respawn_pos[:, 0] = safe_xy[:, 0]
-                respawn_pos[:, 1] = safe_xy[:, 1]
-                respawn_pos[:, 2] = ROBOT_SPAWN[2]
+                    # ---- Joint indexing ----------------------------------- #
+                    name_to_joint = {j.name: j for j in robot.joints}
+                    missing = [jn for jn in JOINTS_ACTUATED if jn not in name_to_joint]
+                    if missing:
+                        print(f"ERROR: missing joints in URDF: {missing}")
+                        sys.exit(1)
 
-                # Random yaw for variety.
-                yaw_angles = torch.rand(n_reset, device=gs.device) * 2 * math.pi
-                respawn_quat = torch.zeros((n_reset, 4), device=gs.device)
-                respawn_quat[:, 0] = torch.cos(yaw_angles * 0.5)   # w
-                respawn_quat[:, 3] = torch.sin(yaw_angles * 0.5)   # z
+                    dof_idx = [list(name_to_joint[jn].dofs_idx_local)[0]
+                               for jn in JOINTS_ACTUATED]
+                    act_dofs = torch.tensor(dof_idx, device=gs.device, dtype=torch.int64)
 
-                robot.set_pos(respawn_pos, envs_idx=done_ids)
-                robot.set_quat(respawn_quat, envs_idx=done_ids)
+                    q0 = torch.tensor(Q0_VALUES, device=gs.device, dtype=torch.float32)
 
-                # Zero out base velocities for reset envs.
-                robot.set_vel(
-                    torch.zeros((n_reset, 3), device=gs.device), envs_idx=done_ids
-                )
-                robot.set_ang(
-                    torch.zeros((n_reset, 3), device=gs.device), envs_idx=done_ids
-                )
+                    robot.set_dofs_kp(torch.ones(12, device=gs.device) * cfg.kp, act_dofs)
+                    robot.set_dofs_kv(torch.ones(12, device=gs.device) * cfg.kv, act_dofs)
 
-            # -- Record data (CPU to stay in RAM) --------------------------- #
-            d_proprio[:, step]    = proprio_noisy.cpu()
-            d_cmds[:, step]       = scaled_cmds.cpu()
-            d_dones[:, step]      = done.cpu()
-            d_base_pos[:, step]   = pos.cpu()
-            d_base_quat[:, step]  = quat.cpu()
-            d_joint_pos[:, step]  = q.cpu()
-            d_collisions[:, step] = colliding.cpu()
+                    # ---- Per-scene state --------------------------------- #
+                    ou_noise = OUNoiseBatched(batch_n_envs, 3, gs.device)
+                    latency_buffer = torch.zeros((2, batch_n_envs, 3), device=gs.device)
+                    prev_a = torch.zeros((batch_n_envs, 12), device=gs.device)
 
-            # Progress reporting every 10%.
-            if (step + 1) % max(1, args.steps // 10) == 0:
-                elapsed = time.time() - t0
-                fps = cfg.n_envs * (step + 1) / elapsed
-                print(f"  Step {step + 1:>6d}/{args.steps}  |  "
-                      f"FPS: {fps:,.0f}  |  resets so far: {total_resets}")
+                    for step in range(args.steps):
+                        # -- Command generation (OU noise -> tanh -> scale) - #
+                        raw_cmds = torch.tanh(ou_noise.step())
+                        scaled_cmds = raw_cmds.clone()
+                        scaled_cmds[:, 0] *= 0.40   # vx
+                        scaled_cmds[:, 1] *= 0.25   # vy
+                        scaled_cmds[:, 2] *= 0.60   # wz
+
+                        # Two-step command latency buffer.
+                        latency_buffer = torch.roll(latency_buffer, shifts=-1, dims=0)
+                        latency_buffer[-1] = scaled_cmds
+                        active_cmds = latency_buffer[0]
+
+                        # -- Read robot state ------------------------------- #
+                        pos = robot.get_pos()
+                        quat = robot.get_quat()
+                        vel_b = world_to_body_vec(quat, robot.get_vel())
+                        ang_b = world_to_body_vec(quat, robot.get_ang())
+                        q = robot.get_dofs_position(act_dofs)
+                        dq = robot.get_dofs_velocity(act_dofs)
+                        q_rel = q - q0.unsqueeze(0)
+
+                        # 47-dim proprio: [height(1), quat(4), vel_body(3),
+                        # ang_body(3), q_rel(12), dq(12), prev_action(12)]
+                        proprio = torch.cat(
+                            [pos[:, 2:3], quat, vel_b, ang_b, q_rel, dq, prev_a], dim=1
+                        )
+
+                        # -- Synthetic sensor noise ------------------------- #
+                        noise = torch.randn_like(proprio) * 0.01
+                        noise[:, 1:5] *= 2.0
+                        noise[:, 5:11] *= 5.0
+                        proprio_noisy = proprio + noise
+
+                        # -- Forward pass through frozen policy ------------- #
+                        obs = torch.cat([proprio_noisy, active_cmds], dim=1)
+                        actions = model.act_deterministic(obs)
+                        prev_a = actions.clone()
+
+                        # -- Compute joint targets and step physics --------- #
+                        q_tgt = q0.unsqueeze(0) + cfg.action_scale * actions
+                        q_tgt[:, 0:4] = torch.clamp(q_tgt[:, 0:4], -0.8, 0.8)
+                        q_tgt[:, 4:8] = torch.clamp(q_tgt[:, 4:8], -1.5, 1.5)
+                        q_tgt[:, 8:12] = torch.clamp(q_tgt[:, 8:12], -2.5, -0.5)
+
+                        robot.control_dofs_position(q_tgt, act_dofs)
+                        for _ in range(cfg.decimation):
+                            scene.step()
+
+                        # -- Termination: falls and collisions -------------- #
+                        fallen = pos[:, 2] < cfg.min_z
+                        colliding = detect_collisions(
+                            pos[:, :2], layout, margin=cfg.collision_margin
+                        )
+                        done = fallen | colliding
+
+                        # -- Reset environments that are done --------------- #
+                        done_ids = torch.nonzero(done).squeeze(-1)
+                        if done_ids.numel() > 0:
+                            total_resets += done_ids.numel()
+                            ou_noise.reset(done_ids)
+                            prev_a[done_ids] = 0.0
+
+                            n_reset = done_ids.numel()
+                            robot.set_dofs_position(
+                                q0.unsqueeze(0).expand(n_reset, -1), act_dofs, envs_idx=done_ids
+                            )
+                            robot.set_dofs_velocity(
+                                torch.zeros((n_reset, 12), device=gs.device), act_dofs, envs_idx=done_ids
+                            )
+
+                            safe_xy = sample_safe_positions(
+                                n_reset,
+                                layout,
+                                clearance=cfg.safe_clearance,
+                                device=gs.device,
+                            )
+
+                            respawn_pos = torch.zeros((n_reset, 3), device=gs.device)
+                            respawn_pos[:, 0] = safe_xy[:, 0]
+                            respawn_pos[:, 1] = safe_xy[:, 1]
+                            respawn_pos[:, 2] = ROBOT_SPAWN[2]
+
+                            yaw_angles = torch.rand(n_reset, device=gs.device) * 2 * math.pi
+                            respawn_quat = torch.zeros((n_reset, 4), device=gs.device)
+                            respawn_quat[:, 0] = torch.cos(yaw_angles * 0.5)
+                            respawn_quat[:, 3] = torch.sin(yaw_angles * 0.5)
+
+                            robot.set_pos(respawn_pos, envs_idx=done_ids, zero_velocity=True)
+                            robot.set_quat(respawn_quat, envs_idx=done_ids, zero_velocity=False)
+
+                        # -- Record data (CPU to stay in RAM) --------------- #
+                        d_proprio[batch_slice, step] = proprio_noisy.cpu()
+                        d_cmds[batch_slice, step] = scaled_cmds.cpu()
+                        d_dones[batch_slice, step] = done.cpu()
+                        d_base_pos[batch_slice, step] = pos.cpu()
+                        d_base_quat[batch_slice, step] = quat.cpu()
+                        d_joint_pos[batch_slice, step] = q.cpu()
+                        d_collisions[batch_slice, step] = colliding.cpu()
+
+                        # Progress reporting every 10%.
+                        if (step + 1) % max(1, args.steps // 10) == 0:
+                            elapsed = time.time() - t0
+                            env_steps_done = env_start * args.steps + batch_n_envs * (step + 1)
+                            fps = env_steps_done / elapsed
+                            print(
+                                f"  Batch {batch_idx + 1}/{n_scene_batches} | "
+                                f"Step {step + 1:>6d}/{args.steps}  |  "
+                                f"FPS: {fps:,.0f}  |  resets so far: {total_resets}"
+                            )
+                finally:
+                    if scene is not None:
+                        scene.destroy()
+                        del scene
+                        gc.collect()
+        finally:
+            if model is not None:
+                del model
+            if getattr(gs, "_initialized", False):
+                gs.destroy()
+            gc.collect()
 
         # -- Save chunk ----------------------------------------------------- #
         chunk_path = out_dir / f"chunk_{chunk_idx:04d}.npz"

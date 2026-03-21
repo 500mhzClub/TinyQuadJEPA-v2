@@ -20,9 +20,17 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    files = sorted(glob.glob(os.path.join(args.data_dir, "*_rgb.h5")))
+    files = []
+    seen = set()
+    for pattern in ("*_rgb.h5", "chunk_*.h5"):
+        for path in sorted(glob.glob(os.path.join(args.data_dir, pattern))):
+            if "_tmp_" in os.path.basename(path):
+                continue
+            if path not in seen:
+                files.append(path)
+                seen.add(path)
     if not files:
-        print(f"No *_rgb.h5 files found in {args.data_dir}")
+        print(f"No rendered HDF5 chunk files found in {args.data_dir}")
         return
 
     rng = np.random.RandomState(42)

@@ -13,7 +13,12 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import sys
 import time
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -60,6 +65,7 @@ def save_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler,
+    scaler: GradScaler,
     epoch: int,
     global_step: int,
     ema_tau: float,
@@ -69,12 +75,18 @@ def save_checkpoint(
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
             "epoch": epoch,
             "global_step": global_step,
             "ema_tau": ema_tau,
         },
         path,
     )
+    # Keep latest.pt pointing at the most recent checkpoint
+    latest = os.path.join(os.path.dirname(path), "latest.pt")
+    if os.path.islink(latest):
+        os.remove(latest)
+    os.symlink(os.path.abspath(path), latest)
 
 
 # ---------------------------------------------------------------------
@@ -86,17 +98,19 @@ def train(args: argparse.Namespace) -> None:
     print(f"Initializing JEPA training on {device}")
 
     # ---- Dataset / DataLoader ----------------------------------------
+    num_workers = 12
     dataset = StreamingJEPADataset(
         data_dir=args.data_dir,
         seq_len=args.seq_len,
         batch_size=args.batch_size,
         require_no_done=False,
         require_no_collision=False,
+        num_workers=num_workers,
     )
     dataloader = DataLoader(
         dataset,
         batch_size=None,
-        num_workers=12,
+        num_workers=num_workers,
         pin_memory=True,
         prefetch_factor=2,
     )
@@ -127,15 +141,17 @@ def train(args: argparse.Namespace) -> None:
     )
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
+    scaler = GradScaler("cuda")
+
     if args.resume_from and os.path.exists(args.resume_from):
         try:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            if "scaler_state_dict" in ckpt:
+                scaler.load_state_dict(ckpt["scaler_state_dict"])
             print(f"Restored optimizer & scheduler state. Resuming at epoch {start_epoch}, step {global_step}.")
         except Exception as e:
             print(f"Warning: could not restore optimizer/scheduler state: {e}")
-
-    scaler = GradScaler("cuda")
 
     # ---- Logging setup -----------------------------------------------
     os.makedirs(args.out_dir, exist_ok=True)
@@ -146,7 +162,7 @@ def train(args: argparse.Namespace) -> None:
     if write_header:
         with open(csv_path, mode="w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["step", "epoch", "mse_loss", "ema_tau", "lr", "z_target_std"])
+            writer.writerow(["step", "epoch", "mse_loss", "ema_tau", "lr", "z_target_std", "grad_norm"])
 
     # ---- Training loop -----------------------------------------------
     num_steps_per_timestep = args.seq_len - 1
@@ -225,7 +241,7 @@ def train(args: argparse.Namespace) -> None:
             # Backward pass
             scaler.scale(seq_loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=args.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=args.grad_clip).item()
             scaler.step(optimizer)
             scaler.update()
 
@@ -255,12 +271,14 @@ def train(args: argparse.Namespace) -> None:
                     f"{ema_tau:.6f}",
                     f"{current_lr:.2e}",
                     f"{z_target_std:.6f}",
+                    f"{grad_norm:.4f}",
                 ])
 
             if global_step % 5 == 0:
                 pbar.set_postfix({
                     "loss": f"{loss_val:.4f}",
                     "z_std": f"{z_target_std:.3f}",
+                    "gnorm": f"{grad_norm:.3f}",
                     "tau": f"{ema_tau:.4f}",
                     "lr": f"{current_lr:.1e}",
                 })
@@ -268,8 +286,13 @@ def train(args: argparse.Namespace) -> None:
             # ---- Intra-epoch checkpoint ------------------------------
             if global_step % args.save_every == 0:
                 ckpt_path = os.path.join(args.out_dir, f"step_{global_step}.pt")
-                save_checkpoint(ckpt_path, model, optimizer, scheduler, epoch, global_step, ema_tau)
+                save_checkpoint(ckpt_path, model, optimizer, scheduler, scaler, epoch, global_step, ema_tau)
                 print(f"\n  Checkpoint saved: {ckpt_path}")
+                # Keep only the last 3 step checkpoints
+                import glob as _glob
+                step_ckpts = sorted(_glob.glob(os.path.join(args.out_dir, "step_*.pt")))
+                for old in step_ckpts[:-3]:
+                    os.remove(old)
 
         # ---- End of epoch --------------------------------------------
         scheduler.step()
@@ -284,7 +307,7 @@ def train(args: argparse.Namespace) -> None:
         )
 
         epoch_ckpt_path = os.path.join(args.out_dir, f"epoch_{epoch + 1}.pt")
-        save_checkpoint(epoch_ckpt_path, model, optimizer, scheduler, epoch, global_step, ema_tau)
+        save_checkpoint(epoch_ckpt_path, model, optimizer, scheduler, scaler, epoch, global_step, ema_tau)
         print(f"  Epoch checkpoint saved: {epoch_ckpt_path}")
 
     print("Training complete.")

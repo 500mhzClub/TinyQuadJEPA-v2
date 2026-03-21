@@ -4,6 +4,7 @@ __pycache__/
 *.egg
 dist/
 build/
+.venv/
 
 # Data and checkpoints (large files)
 jepa_raw_data/
@@ -14,6 +15,11 @@ jepa_logs/*.mp4
 jepa_logs/*.csv
 energy_head_logs/
 verification_videos/
+requirements.local.lock
+models/
+*.mp4
+*.h5
+*.png
 
 # Generated textures
 textures/

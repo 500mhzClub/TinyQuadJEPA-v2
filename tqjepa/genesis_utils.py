@@ -10,24 +10,44 @@ def resolve_sim_backend(sim_backend_arg: str):
     import genesis as gs  # noqa: delay import
 
     sim_backend_arg = sim_backend_arg.lower().strip()
-    gpu_backend = getattr(gs, "gpu", getattr(gs, "cuda", None))
+    gpu_backend = getattr(gs, "gpu", None)
+    explicit_backends = {
+        "cpu": ("cpu", "CPU requested"),
+        "gpu": ("gpu", "GPU requested"),
+        "cuda": ("cuda", "CUDA requested"),
+        "vulkan": ("vulkan", "Vulkan requested"),
+        "metal": ("metal", "Metal requested"),
+    }
 
-    if sim_backend_arg in ("cpu",):
-        return gs.cpu, "CPU requested"
-    if sim_backend_arg in ("gpu", "cuda"):
-        return gpu_backend if gpu_backend is not None else gs.cpu, "GPU requested"
     if sim_backend_arg == "auto":
         if gpu_backend is not None:
             return gpu_backend, "AUTO (GPU preferred)"
+        for attr_name, msg in (
+            ("cuda", "AUTO (CUDA fallback)"),
+            ("vulkan", "AUTO (Vulkan fallback)"),
+            ("metal", "AUTO (Metal fallback)"),
+        ):
+            backend = getattr(gs, attr_name, None)
+            if backend is not None:
+                return backend, msg
         return gs.cpu, "AUTO (CPU fallback)"
-    return gs.cpu, "CPU fallback"
+
+    if sim_backend_arg in explicit_backends:
+        attr_name, msg = explicit_backends[sim_backend_arg]
+        backend = getattr(gs, attr_name, None)
+        if backend is not None:
+            return backend, msg
+        return gs.cpu, f"{msg}; unavailable, falling back to CPU"
+
+    return gs.cpu, f"Unknown backend '{sim_backend_arg}', falling back to CPU"
 
 
-def init_genesis_once(sim_backend_arg: str = "auto") -> None:
+def init_genesis_once(sim_backend_arg: str = "auto", logging_level=None) -> None:
     import genesis as gs  # noqa: delay import
+    import logging
     backend, msg = resolve_sim_backend(sim_backend_arg)
-    print(f"Initialising Genesis ({msg}) ...")
-    gs.init(backend=backend)
+    level = logging.WARNING if logging_level is None else logging_level
+    gs.init(backend=backend, logging_level=level)
 
 
 def to_genesis_target(x: torch.Tensor) -> torch.Tensor:

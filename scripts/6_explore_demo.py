@@ -25,10 +25,15 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Dict, List, Optional, Tuple
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 import imageio
 import numpy as np
@@ -599,6 +604,84 @@ def rollout_cmd_kinematic(
     return np.stack(path, axis=0), pos.copy(), float(yaw)
 
 
+def rollout_cmds_batched_paths(
+    start_xy: np.ndarray,
+    start_yaw: float,
+    cmds: torch.Tensor,
+    hz: int,
+    dt: float = 0.10,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Batched kinematic rollout for N candidates on the cmds device.
+
+    Returns:
+        paths  : (N, hz, 2) world-frame waypoints at each step
+        end_xy : (N, 2) final positions
+    """
+    N = cmds.shape[0]
+    px = cmds.new_full((N,), float(start_xy[0]))
+    py = cmds.new_full((N,), float(start_xy[1]))
+    yaw = cmds.new_full((N,), float(start_yaw))
+    vx, vy, wyaw = cmds[:, 0], cmds[:, 1], cmds[:, 2]
+    xs, ys = [], []
+    for _ in range(hz):
+        xs.append(px)
+        ys.append(py)
+        cy, sy = torch.cos(yaw), torch.sin(yaw)
+        px = px + dt * (cy * vx - sy * vy)
+        py = py + dt * (sy * vx + cy * vy)
+        yaw = yaw + dt * wyaw
+    paths = torch.stack([torch.stack(xs, dim=1), torch.stack(ys, dim=1)], dim=2)
+    return paths, torch.stack([px, py], dim=1)
+
+
+def path_collision_penalty_batched(sm: SensorMap, paths_np: np.ndarray) -> np.ndarray:
+    """Vectorised version of path_collision_penalty.
+
+    paths_np : (N, hz, 2)
+    Returns  : (N,) penalty per candidate
+    """
+    N, hz, _ = paths_np.shape
+    pts = paths_np.reshape(-1, 2)
+    gx = np.clip(((pts[:, 0] - float(WORLD_MIN[0])) / sm.res).astype(np.int32), 0, sm.w - 1)
+    gy = np.clip(((pts[:, 1] - float(WORLD_MIN[1])) / sm.res).astype(np.int32), 0, sm.h - 1)
+    cell = sm.grid[gy, gx]
+    pen = (cell == MAP_OCC).astype(np.float32) * 1.8
+    # Simplified clearance: penalise occupied immediate neighbours (4-connected).
+    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        gyn = np.clip(gy + dr, 0, sm.h - 1)
+        gxn = np.clip(gx + dc, 0, sm.w - 1)
+        pen += (sm.grid[gyn, gxn] == MAP_OCC).astype(np.float32) * (0.25 * 0.06)
+    return pen.reshape(N, hz).sum(axis=1)
+
+
+def local_unknown_gain_batched(
+    sm: SensorMap, end_xy: np.ndarray, radius: float = 0.55,
+) -> np.ndarray:
+    """Vectorised version of local_unknown_gain.
+
+    end_xy : (N, 2)
+    Returns: (N,) gain values
+    """
+    N = end_xy.shape[0]
+    gx0 = ((end_xy[:, 0] - float(WORLD_MIN[0])) / sm.res).astype(np.int32)
+    gy0 = ((end_xy[:, 1] - float(WORLD_MIN[1])) / sm.res).astype(np.int32)
+    rr = max(1, int(radius / sm.res))
+    counts = np.zeros(N, dtype=np.float32)
+    for dr in range(-rr, rr + 1):
+        for dc in range(-rr, rr + 1):
+            gyn = gy0 + dr
+            gxn = gx0 + dc
+            valid = (gyn >= 0) & (gyn < sm.h) & (gxn >= 0) & (gxn < sm.w)
+            px = float(WORLD_MIN[0]) + (gxn + 0.5) * sm.res
+            py = float(WORLD_MIN[1]) + (gyn + 0.5) * sm.res
+            in_r = np.sqrt((px - end_xy[:, 0]) ** 2 + (py - end_xy[:, 1]) ** 2) <= radius
+            gyn_c = np.clip(gyn, 0, sm.h - 1)
+            gxn_c = np.clip(gxn, 0, sm.w - 1)
+            is_unk = sm.grid[gyn_c, gxn_c] == MAP_UNKNOWN
+            counts += (valid & in_r & is_unk).astype(np.float32)
+    return counts * 0.08
+
+
 def path_collision_penalty(sm: SensorMap, path_xy: np.ndarray) -> float:
     """Score a kinematic path for collision / obstacle proximity."""
     pen = 0.0
@@ -695,68 +778,46 @@ def plan_local_cmd(
         # Latent magnitude: large values suggest the trajectory diverges.
         latent_mag = z_roll.norm(dim=-1) / z_ref_norm  # (cands,)
 
-        costs = []
-        paths = []
-        frontier_vals = []
-        progress_vals = []
-        latent_mags = []
+        # Batched kinematic rollout — one GPU op instead of cands Python calls.
+        paths_t, end_xy_t = rollout_cmds_batched_paths(robot_xy, robot_yaw, cmds, hz)
+        paths_np = paths_t.cpu().numpy()          # (N, hz, 2)
+        end_xy_np = end_xy_t.cpu().numpy()        # (N, 2)
 
-        for i in range(cands):
-            cmd_np = cmds[i].detach().cpu().numpy()
-            path_xy, end_xy, _end_yaw = rollout_cmd_kinematic(
-                robot_xy, robot_yaw, cmd_np, hz,
-            )
-            paths.append(path_xy)
+        # Vectorised cost terms.
+        end_dist = np.linalg.norm(end_xy_np - frontier_xy, axis=1)   # (N,)
+        progress_np = (goal_dist - end_dist).astype(np.float32)
+        frontier_np = local_unknown_gain_batched(sm, end_xy_np, radius=0.55)
+        coll_np     = path_collision_penalty_batched(sm, paths_np)
 
-            end_dist = float(np.linalg.norm(end_xy - frontier_xy))
-            progress = goal_dist - end_dist
-            progress_vals.append(progress)
+        progress_t = torch.from_numpy(progress_np).to(dev)
+        frontier_t = torch.from_numpy(frontier_np).to(dev)
+        coll_t     = torch.from_numpy(coll_np).to(dev)
 
-            frontier_gain = local_unknown_gain(sm, end_xy, radius=0.55)
-            frontier_vals.append(frontier_gain)
+        latent_pen = (latent_mag - 1.5).clamp(min=0.0) * 0.15
+        smooth_pen = (
+            torch.zeros(cands, device=dev) if prev_cmd is None
+            else 0.10 * (cmds - prev_cmd).pow(2).sum(dim=-1)
+        )
+        reverse_pen = (cmds[:, 0] < -0.02).float() * 0.08
 
-            coll_pen = path_collision_penalty(sm, path_xy)
-            smooth_pen = (
-                0.0 if prev_cmd is None
-                else 0.10 * float(torch.sum((cmds[i] - prev_cmd[0]) ** 2).item())
-            )
-            reverse_pen = 0.08 if float(cmds[i, 0].item()) < -0.02 else 0.0
+        costs_t = (
+            coll_t + latent_pen + smooth_pen + reverse_pen
+            - 3.00 * progress_t - 0.80 * frontier_t
+        )
 
-            # Latent divergence penalty: penalise when the predicted latent
-            # norm is much larger than the current state's norm.
-            lm = float(latent_mag[i].item())
-            latent_mags.append(lm)
-            latent_pen = max(0.0, lm - 1.5) * 0.15
-
-            # Lower is better.
-            # v2: more aggressive progress weight, lower collision timidity.
-            cost = (
-                coll_pen
-                + latent_pen
-                + smooth_pen
-                + reverse_pen
-                - 3.00 * progress
-                - 0.80 * frontier_gain
-            )
-            costs.append(cost)
-
-        costs_np = np.asarray(costs, dtype=np.float32)
         elite_k = max(8, cands // 10)
-        elite_idx = np.argsort(costs_np)[:elite_k]
-        elite_cmds = cmds[
-            torch.as_tensor(elite_idx, device=dev, dtype=torch.long)
-        ]
-        mean = elite_cmds.mean(dim=0)
-        std = elite_cmds.std(dim=0) + 1e-4
+        elite_idx = torch.topk(costs_t, k=elite_k, largest=False).indices
+        mean = cmds[elite_idx].mean(dim=0)
+        std  = cmds[elite_idx].std(dim=0) + 1e-4
 
-        i_best = int(np.argmin(costs_np))
+        i_best = int(torch.argmin(costs_t).item())
         cur = {
-            "cmd": cmds[i_best].detach().clone().view(1, 3),
-            "path": paths[i_best],
-            "frontier": float(frontier_vals[i_best]),
-            "latent_mag": float(latent_mags[i_best]),
-            "prog": float(progress_vals[i_best]),
-            "cost": float(costs_np[i_best]),
+            "cmd":        cmds[i_best].detach().clone().view(1, 3),
+            "path":       paths_np[i_best],
+            "frontier":   float(frontier_t[i_best].item()),
+            "latent_mag": float(latent_mag[i_best].item()),
+            "prog":       float(progress_t[i_best].item()),
+            "cost":       float(costs_t[i_best].item()),
         }
         if best is None or cur["cost"] < best["cost"]:
             best = cur
@@ -940,7 +1001,12 @@ def main():
     parser.add_argument("--jepa_ckpt", required=True, help="Path to CanonicalJEPA checkpoint")
     parser.add_argument("--ppo_ckpt", required=True, help="Path to PPO ActorCritic checkpoint")
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--sim_backend", type=str, default="auto")
+    parser.add_argument(
+        "--sim_backend",
+        type=str,
+        default="auto",
+        help="Genesis backend: auto | gpu | cuda | vulkan | metal | cpu.",
+    )
     parser.add_argument("--n_steps", type=int, default=1800)
     parser.add_argument("--cands", type=int, default=512)
     parser.add_argument("--horizon", type=int, default=15)

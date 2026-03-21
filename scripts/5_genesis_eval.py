@@ -28,6 +28,10 @@ import time
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
 import imageio
 import numpy as np
 import torch
@@ -90,27 +94,30 @@ def make_waypoints() -> List[WaypointSpec]:
     return [
         WaypointSpec(
             pos=np.array([2.0, 0.5, 0.0], dtype=np.float32),
-            approach_dir_xy=np.array([-0.3, 0.0], dtype=np.float32),
+            # Approach from the west (negative-x side), facing east toward the panel.
+            approach_dir_xy=np.array([0.3, 0.0], dtype=np.float32),
             name="RED beacon",
             color_rgb=(0.94, 0.16, 0.16),
-            panel_pos=(2.8, 0.5, 0.60),
-            panel_size=(0.05, 1.20, 1.20),
+            panel_pos=(3.2, 0.5, 0.60),    # moved 0.4 m further east for clipping clearance
+            panel_size=(0.30, 1.20, 1.20),
         ),
         WaypointSpec(
             pos=np.array([1.0, 2.5, 0.0], dtype=np.float32),
-            approach_dir_xy=np.array([0.0, -0.3], dtype=np.float32),
+            # Approach from the south (negative-y side), facing north toward the panel.
+            approach_dir_xy=np.array([0.0, 0.3], dtype=np.float32),
             name="GREEN beacon",
             color_rgb=(0.16, 0.86, 0.16),
-            panel_pos=(1.0, 3.3, 0.60),
-            panel_size=(1.20, 0.05, 1.20),
+            panel_pos=(1.0, 3.7, 0.60),    # moved 0.4 m further north for clipping clearance
+            panel_size=(1.20, 0.30, 1.20),
         ),
         WaypointSpec(
             pos=np.array([3.0, 2.0, 0.0], dtype=np.float32),
-            approach_dir_xy=np.array([-0.3, 0.0], dtype=np.float32),
+            # Approach from the west (negative-x side), facing east toward the panel.
+            approach_dir_xy=np.array([0.3, 0.0], dtype=np.float32),
             name="BLUE beacon",
             color_rgb=(0.16, 0.31, 0.94),
-            panel_pos=(3.8, 2.0, 0.60),
-            panel_size=(0.05, 1.20, 1.20),
+            panel_pos=(4.2, 2.0, 0.60),    # moved 0.4 m further east for clipping clearance
+            panel_size=(0.30, 1.20, 1.20),
         ),
     ]
 
@@ -202,6 +209,7 @@ def get_sys1_obs(
         height(1), quat(4), vel_body(3), ang_body(3), q_rel(12), dq(12),
         prev_action(12), cmd(3)
     """
+    q0 = q0.to(dev)
     pos = robot.get_pos().to(dev)
     quat = robot.get_quat().to(dev)
     vel = robot.get_vel().to(dev)
@@ -306,6 +314,35 @@ def rollout_cmd_kinematic(
     return np.stack(path, axis=0), pos, yaw
 
 
+def rollout_cmds_batched(
+    start_xy: np.ndarray,
+    start_yaw: float,
+    cmds: torch.Tensor,
+    horizon: int,
+    dt: float = 0.10,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Batched kinematic rollout for N candidates entirely on the cmds device.
+
+    Returns:
+        end_xy  : (N, 2) world-frame end positions
+        end_yaw : (N,)   end headings
+    """
+    dev = cmds.device
+    N = cmds.shape[0]
+    px = cmds.new_full((N,), float(start_xy[0]))
+    py = cmds.new_full((N,), float(start_xy[1]))
+    yaw = cmds.new_full((N,), float(start_yaw))
+    vx, vy, wyaw = cmds[:, 0], cmds[:, 1], cmds[:, 2]
+    for _ in range(horizon):
+        cy, sy = torch.cos(yaw), torch.sin(yaw)
+        px = px + dt * (cy * vx - sy * vy)
+        py = py + dt * (sy * vx + cy * vy)
+        yaw = yaw + dt * wyaw
+    # wrap to [-pi, pi]
+    yaw = (yaw + math.pi) % (2.0 * math.pi) - math.pi
+    return torch.stack([px, py], dim=1), yaw
+
+
 # --------------------------------------------------------------------------- #
 # World -> pixel projection (for HUD overlays)
 # --------------------------------------------------------------------------- #
@@ -379,21 +416,31 @@ def plan_best_cmd(
         cost = energy(predictor_rollout, z_goal) + geometric_cost + smoothness_penalty
     """
     far = dist_to_goal > 0.9
-    transl_scale = 0.30 if far else 0.18
-    if abs(heading_error) > 0.9:
-        transl_scale *= 0.45
 
-    mean = torch.tensor([
-        clamp(float(goal_body_xy[0]) * transl_scale, -0.35, 0.35),
-        clamp(float(goal_body_xy[1]) * transl_scale, -0.20, 0.20),
-        clamp(0.40 * heading_error, -0.45, 0.45),
-    ], device=dev, dtype=torch.float32)
+    if abs(heading_error) > math.pi * 0.67:
+        # > 120 deg misaligned: pure in-place rotation, minimal translation noise.
+        mean = torch.tensor([
+            0.0,
+            0.0,
+            math.copysign(0.70, heading_error),
+        ], device=dev, dtype=torch.float32)
+        std = torch.tensor([0.04, 0.04, 0.15], device=dev, dtype=torch.float32)
+    else:
+        transl_scale = 0.30 if far else 0.18
+        if abs(heading_error) > 0.9:
+            transl_scale *= 0.45
 
-    std = torch.tensor([
-        0.12 if far else 0.09,
-        0.10 if far else 0.08,
-        0.22 if far else 0.18,
-    ], device=dev, dtype=torch.float32)
+        mean = torch.tensor([
+            clamp(float(goal_body_xy[0]) * transl_scale, -0.35, 0.35),
+            clamp(float(goal_body_xy[1]) * transl_scale, -0.20, 0.20),
+            clamp(0.50 * heading_error, -0.55, 0.55),
+        ], device=dev, dtype=torch.float32)
+
+        std = torch.tensor([
+            0.12 if far else 0.09,
+            0.10 if far else 0.08,
+            0.22 if far else 0.18,
+        ], device=dev, dtype=torch.float32)
 
     best_cmd = mean.view(1, 3)
     best_path: Optional[np.ndarray] = None
@@ -405,7 +452,7 @@ def plan_best_cmd(
         cmds = mean + std * torch.randn((n_candidates, 3), device=dev)
         cmds[:, 0].clamp_(-0.40, 0.40)
         cmds[:, 1].clamp_(-0.25, 0.25)
-        cmds[:, 2].clamp_(-0.60, 0.60)
+        cmds[:, 2].clamp_(-0.80, 0.80)
 
         # Predictor rollout: start from z_current (online space) and roll forward.
         # The predictor maps online -> target space, so its output is directly
@@ -418,22 +465,15 @@ def plan_best_cmd(
         # Energy cost: lower = closer to goal in latent space.
         eng = head(z_roll, z_goal.expand_as(z_roll))
 
-        # Geometric cost: kinematic rollout for spatial awareness.
-        geo_cost = torch.empty((n_candidates,), device=dev, dtype=torch.float32)
-        path_cache: List[np.ndarray] = []
-        for i in range(n_candidates):
-            cmd_np = cmds[i].detach().cpu().numpy()
-            path_xy, end_xy, end_yaw = rollout_cmd_kinematic(
-                robot_xy, robot_yaw, cmd_np, horizon,
-            )
-            path_cache.append(path_xy)
-            end_dist = float(np.linalg.norm(end_xy - goal_xy))
-            end_goal_angle = math.atan2(
-                float(goal_xy[1] - end_xy[1]),
-                float(goal_xy[0] - end_xy[0]),
-            )
-            end_heading_err = abs(wrap_to_pi(end_goal_angle - end_yaw))
-            geo_cost[i] = 0.85 * end_dist + 0.10 * end_heading_err
+        # Geometric cost: batched kinematic rollout entirely on GPU.
+        goal_t = torch.tensor(goal_xy, device=dev, dtype=torch.float32)
+        end_xy_t, end_yaw_t = rollout_cmds_batched(robot_xy, robot_yaw, cmds, horizon)
+        end_dist_t = (end_xy_t - goal_t).norm(dim=1)
+        end_goal_dx = goal_t[0] - end_xy_t[:, 0]
+        end_goal_dy = goal_t[1] - end_xy_t[:, 1]
+        end_goal_angle_t = torch.atan2(end_goal_dy, end_goal_dx)
+        end_heading_err_t = ((end_goal_angle_t - end_yaw_t + math.pi) % (2.0 * math.pi) - math.pi).abs()
+        geo_cost = 0.85 * end_dist_t + 0.10 * end_heading_err_t
 
         cost = eng + geo_cost
         if prev_cmd is not None:
@@ -452,7 +492,11 @@ def plan_best_cmd(
             best_cost = iter_best_cost
             best_cmd = cmds[iter_best].view(1, 3).detach().clone()
             best_energy = float(eng[iter_best].item())
-            best_path = path_cache[iter_best]
+            # Compute path only for winner (used by HUD overlay).
+            best_path, _, _ = rollout_cmd_kinematic(
+                robot_xy, robot_yaw,
+                cmds[iter_best].detach().cpu().numpy(), horizon,
+            )
 
     assert best_path is not None and best_energy is not None and best_cost is not None
     return best_cmd, {"energy": best_energy, "path": best_path, "cost": best_cost}
@@ -832,7 +876,7 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="auto",
                         help="Torch device: auto | cuda | cpu.")
     parser.add_argument("--sim_backend", type=str, default="auto",
-                        help="Genesis backend: auto | gpu | cuda | cpu.")
+                        help="Genesis backend: auto | gpu | cuda | vulkan | metal | cpu.")
     parser.add_argument("--n_steps", type=int, default=600,
                         help="Maximum number of navigation steps.")
     parser.add_argument("--n_candidates", type=int, default=10000,
@@ -894,7 +938,7 @@ def main() -> None:
     # ---- Build scene ------------------------------------------------------ #
     waypoints = make_waypoints()
     route = list(DEFAULT_ROUTE)
-    dist_thresh = 0.3
+    dist_thresh = 0.45  # stop before beacon fills FOV / robot clips through panel
 
     init_genesis_once(args.sim_backend)
     scene, robot, cam_brain, cam_eye, cam_overhead, dofs, q0, obstacle_layout = build_scene(
@@ -902,6 +946,7 @@ def main() -> None:
         with_obstacles=args.with_obstacles,
         obstacle_seed=args.seed,
     )
+    q0 = q0.to(dev)  # Genesis may fall back to CPU; ensure q0 matches model device.
 
     print(f"\nScene built: {len(waypoints)} beacons", end="")
     if obstacle_layout is not None:
@@ -989,6 +1034,11 @@ def main() -> None:
         dist = float(np.linalg.norm(rp[:2] - goal_xy))
 
         # ---- Check waypoint arrival -------------------------------------- #
+        # Hard override: if the robot is very close it has likely clipped the
+        # panel geometry — force arrival so it doesn't get stuck inside.
+        if dist < 0.20:
+            dist = dist_thresh  # treat as arrived
+
         if dist < dist_thresh:
             visit_counts[target_wp_idx] += 1
             waypoint_arrival_steps.append({

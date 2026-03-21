@@ -19,9 +19,15 @@ import csv
 import math
 import os
 import random
+import sys
 from dataclasses import dataclass
 from typing import List, Tuple
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,6 +45,69 @@ try:
     torch.set_float32_matmul_precision("high")
 except Exception:
     pass
+
+
+# ── Latent extraction / cache ─────────────────────────────────────────
+
+
+def _extract_latents(
+    loader: DataLoader,
+    model: CanonicalJEPA,
+    device: torch.device,
+    horizon: int,
+    amp_enabled: bool,
+    desc: str = "Extracting latents",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """One-pass extraction of (z_pred, z_goal) pairs from a frozen backbone."""
+    z_preds, z_goals = [], []
+    with torch.no_grad():
+        for vis, prop, cmds, _dones, _cols in tqdm(loader, desc=desc):
+            vis = vis.to(device, non_blocking=True).float().div_(255.0)
+            prop = prop.to(device, non_blocking=True)
+            cmds = cmds.to(device, non_blocking=True)
+            with autocast(device_type=device.type, dtype=torch.bfloat16,
+                          enabled=amp_enabled):
+                zp, zg = rollout_terminal_latent(model, vis, prop, cmds, horizon)
+            z_preds.append(zp.float().cpu().numpy())
+            z_goals.append(zg.float().cpu().numpy())
+    return np.concatenate(z_preds, axis=0), np.concatenate(z_goals, axis=0)
+
+
+@torch.no_grad()
+def run_validation_cached(
+    head: GoalEnergyHead,
+    z_pred_val: torch.Tensor,
+    z_goal_val: torch.Tensor,
+    device: torch.device,
+    batch_size: int,
+    num_negatives: int,
+    margin: float,
+    reg_weight: float,
+    max_batches: int,
+) -> StepStats:
+    head.eval()
+    losses, pos_vals, neg_vals, gaps, accs = [], [], [], [], []
+    n = z_pred_val.shape[0]
+    for b0 in range(0, min(n, max_batches * batch_size), batch_size):
+        zp = z_pred_val[b0 : b0 + batch_size].to(device)
+        zg = z_goal_val[b0 : b0 + batch_size].to(device)
+        z_neg = sample_negative_goals(zg, num_negatives)
+        _, stats = energy_ranking_loss(head, zp, zg, z_neg, margin, reg_weight)
+        losses.append(stats.loss)
+        pos_vals.append(stats.pos_energy)
+        neg_vals.append(stats.neg_energy)
+        gaps.append(stats.gap)
+        accs.append(stats.ranking_acc)
+    if not losses:
+        return StepStats(math.nan, math.nan, math.nan, math.nan, math.nan)
+    n = len(losses)
+    return StepStats(
+        loss=sum(losses) / n,
+        pos_energy=sum(pos_vals) / n,
+        neg_energy=sum(neg_vals) / n,
+        gap=sum(gaps) / n,
+        ranking_acc=sum(accs) / n,
+    )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -285,41 +354,61 @@ def main() -> None:
 
     print(f"  Dataset: {n_total} files -> {len(train_files)} train / {len(val_files)} val")
 
-    train_dataset = StreamingJEPADataset(
-        data_dir=train_dir,
-        seq_len=seq_len,
-        batch_size=args.batch_size,
-        require_no_done=True,
-        require_no_collision=True,
-    )
-    val_dataset = StreamingJEPADataset(
-        data_dir=val_dir,
-        seq_len=seq_len,
-        batch_size=args.batch_size,
-        require_no_done=True,
-        require_no_collision=True,
-    )
+    # ── Latent cache (extracted once, reused every epoch) ─────────
+    ckpt_tag = os.path.splitext(os.path.basename(args.jepa_ckpt))[0]
+    cache_tag = f"{ckpt_tag}_H{args.horizon}"
+    train_cache = os.path.join(args.log_dir, f"latent_cache_{cache_tag}_train.npz")
+    val_cache   = os.path.join(args.log_dir, f"latent_cache_{cache_tag}_val.npz")
 
-    train_loader_kw = dict(
-        dataset=train_dataset,
-        batch_size=None,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-    )
-    if args.num_workers > 0:
-        train_loader_kw["prefetch_factor"] = 2
-    train_loader = DataLoader(**train_loader_kw)
+    def _build_extract_loader(data_dir: str, n_workers: int) -> DataLoader:
+        ds = StreamingJEPADataset(
+            data_dir=data_dir, seq_len=seq_len, batch_size=256,
+            require_no_done=True, require_no_collision=True,
+            num_workers=n_workers,
+        )
+        kw = dict(dataset=ds, batch_size=None, num_workers=n_workers,
+                  pin_memory=(device.type == "cuda"))
+        if n_workers > 0:
+            kw["prefetch_factor"] = 2
+        return DataLoader(**kw)
 
-    val_workers = max(1, args.num_workers // 2)
-    val_loader_kw = dict(
-        dataset=val_dataset,
-        batch_size=None,
-        num_workers=val_workers,
+    if not os.path.exists(train_cache):
+        print("Building train latent cache (one-time)...")
+        loader = _build_extract_loader(train_dir, args.num_workers)
+        zp, zg = _extract_latents(loader, model, device, args.horizon, amp_enabled,
+                                   desc="  train")
+        np.savez(train_cache, z_pred=zp, z_goal=zg)
+        print(f"  Saved {zp.shape[0]:,} pairs -> {train_cache}")
+    else:
+        print(f"  Using cached train latents: {train_cache}")
+
+    if not os.path.exists(val_cache):
+        print("Building val latent cache (one-time)...")
+        loader = _build_extract_loader(val_dir, max(1, args.num_workers // 2))
+        zp, zg = _extract_latents(loader, model, device, args.horizon, amp_enabled,
+                                   desc="  val")
+        np.savez(val_cache, z_pred=zp, z_goal=zg)
+        print(f"  Saved {zp.shape[0]:,} pairs -> {val_cache}")
+    else:
+        print(f"  Using cached val latents: {val_cache}")
+
+    train_np = np.load(train_cache)
+    val_np   = np.load(val_cache)
+    z_pred_train = torch.from_numpy(train_np["z_pred"])
+    z_goal_train = torch.from_numpy(train_np["z_goal"])
+    z_pred_val   = torch.from_numpy(val_np["z_pred"])
+    z_goal_val   = torch.from_numpy(val_np["z_goal"])
+
+    train_latent_ds = torch.utils.data.TensorDataset(z_pred_train, z_goal_train)
+    train_loader = DataLoader(
+        train_latent_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=4,
         pin_memory=(device.type == "cuda"),
+        drop_last=True,
     )
-    if val_workers > 0:
-        val_loader_kw["prefetch_factor"] = 2
-    val_loader = DataLoader(**val_loader_kw)
+    print(f"  Train: {len(z_pred_train):,} pairs | Val: {len(z_pred_val):,} pairs")
 
     # ── CSV log ───────────────────────────────────────────────────
     csv_path = os.path.join(args.log_dir, "energy_head_metrics.csv")
@@ -343,21 +432,12 @@ def main() -> None:
         train_accs: List[float] = []
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
-        for batch_idx, (vis, prop, cmds, _dones, _cols) in enumerate(pbar, start=1):
-            vis = vis.to(device, non_blocking=True).float().div_(255.0)
-            prop = prop.to(device, non_blocking=True)
-            cmds = cmds.to(device, non_blocking=True)
+        for batch_idx, (z_pred, z_goal) in enumerate(pbar, start=1):
+            z_pred = z_pred.to(device, non_blocking=True)
+            z_goal = z_goal.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
-            # Backbone is frozen -> no_grad for the rollout.
-            with torch.no_grad():
-                with autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
-                    z_pred, z_goal = rollout_terminal_latent(
-                        model, vis, prop, cmds, args.horizon,
-                    )
-
-            # Energy head forward + loss (needs gradients).
             with autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
                 z_neg = sample_negative_goals(z_goal, args.n_negatives)
                 loss, stats = energy_ranking_loss(
@@ -411,17 +491,16 @@ def main() -> None:
 
         scheduler.step()
 
-        # ── Validation ────────────────────────────────────────────
-        val_stats = run_validation(
-            model=model,
+        # ── Validation (on cached latents) ────────────────────────
+        val_stats = run_validation_cached(
             head=head,
-            loader=val_loader,
+            z_pred_val=z_pred_val,
+            z_goal_val=z_goal_val,
             device=device,
-            horizon=args.horizon,
+            batch_size=args.batch_size,
             num_negatives=args.n_negatives,
             margin=args.margin,
             reg_weight=args.reg_weight,
-            amp_enabled=amp_enabled,
             max_batches=args.val_batches,
         )
 
