@@ -436,7 +436,18 @@ def select_frontier(sm, robot_xy, blacklist=None, bl_radius=0.40):
             if any(float(np.linalg.norm(wp-bp)) < bl_radius for bp in bl): continue
             cands.append((0.45*float(unk) - 0.30*dist - 0.35*float(occ), wp))
     if not cands:
-        return (select_frontier(sm, robot_xy) if bl else (robot_xy.copy(), 0.0))
+        if bl:
+            return select_frontier(sm, robot_xy)
+        # No free-frontier cells yet — return nearest unknown cell as target
+        best_d, best_wp = float("inf"), robot_xy.copy()
+        for r in range(sm.h):
+            for c in range(sm.w):
+                if sm.grid[r, c] == MAP_UNKNOWN:
+                    wp = grid_to_world(sm, (r, c))
+                    d = float(np.linalg.norm(wp - robot_xy))
+                    if 0.20 < d < best_d:
+                        best_d, best_wp = d, wp
+        return best_wp, 0.0
     cands.sort(key=lambda x: x[0], reverse=True)
     return cands[0][1], cands[0][0]
 
@@ -661,7 +672,9 @@ def plan_explore_cmd(jepa, zc, sm, robot_xy, robot_yaw, frontier_xy,
     goal_vec  = frontier_xy - robot_xy
     goal_dist = float(np.linalg.norm(goal_vec))
     if goal_dist < 1e-6:
-        return torch.zeros((1,3), device=dev), np.zeros((hz,2), np.float32)
+        # No frontier — spin slowly and inch forward to open new territory
+        wander = torch.tensor([[0.20, 0.0, 0.55]], device=dev, dtype=torch.float32)
+        return wander, np.zeros((hz, 2), np.float32)
 
     goal_dir  = goal_vec / goal_dist
     goal_body = world_to_body_xy(robot_yaw, goal_dir)
@@ -957,6 +970,7 @@ def main():
     wander_cmd        = torch.zeros((1,3), device=dev)
 
     discoveries: List[dict] = []
+    plan_path: Optional[np.ndarray] = None
     t0 = time.time()
 
     writer = None
@@ -1050,9 +1064,9 @@ def main():
 
         # ── Command selection ──────────────────────────────────────────── #
         if guard_steps > 0:
-            cmd = guard_cmd; guard_steps -= 1
+            cmd = guard_cmd; guard_steps -= 1; plan_path = None
         elif wander_steps > 0:
-            cmd = wander_cmd; wander_steps -= 1
+            cmd = wander_cmd; wander_steps -= 1; plan_path = None
         elif seeking_idx >= 0:
             # Goal-directed.
             wp      = waypoints[seeking_idx]
@@ -1092,7 +1106,7 @@ def main():
         disp = (float(np.linalg.norm(recent_pos[-1]-recent_pos[0]))
                 if len(recent_pos) >= recent_pos.maxlen else 1.0)
         cov_stall = (len(recent_cov)>=recent_cov.maxlen and
-                     (max(recent_cov)-min(recent_cov)) < 0.3)
+                     (max(recent_cov)-min(recent_cov)) < 1.5)
         if guard_steps <= 0 and wander_steps <= 0 and (disp < 0.12 or cov_stall):
             stuck_count += 1
             frontier_bl.append(frontier_xy.copy())
@@ -1140,7 +1154,7 @@ def main():
                 tgt_xy   = frontier_xy
             frame = compose_frame(
                 over_rgb, eye_rgb, sm, robot_xy, robot_yaw, tgt_xy,
-                trail, plan_path if 'plan_path' in dir() else None,
+                trail, plan_path,
                 waypoints, found, seeking_idx,
                 [
                     f"Step {step}/{args.n_steps} | {n_found}/{len(waypoints)} beacons found",
