@@ -618,11 +618,11 @@ def harvest_explore_reference(
 
 @torch.no_grad()
 def plan_seek_cmd(
-    jepa, head, z_current, z_goal, robot_xy, robot_yaw, goal_xy,
+    jepa, head, z_current, z_goal, sm, robot_xy, robot_yaw, goal_xy,
     goal_body_xy, dist_to_goal, heading_error, n_candidates, horizon, dev,
     prev_cmd=None,
 ):
-    """CEM planner for goal-seeking (energy + geometry).  z_goal: (1,D)."""
+    """CEM planner for goal-seeking (energy + geometry + collision).  z_goal: (1,D)."""
     far = dist_to_goal > 0.9
     speed_scale = float(np.clip(dist_to_goal / 0.9, 0.2, 1.0))
     vx_clamp    = float(np.clip(dist_to_goal * 0.55, 0.15, 0.40))
@@ -665,13 +665,15 @@ def plan_seek_cmd(
         eng = head(z_roll, z_goal.expand_as(z_roll))
 
         goal_t    = torch.tensor(goal_xy, device=dev, dtype=torch.float32)
-        end_xy_t, end_yaw_t = rollout_cmds_batched(robot_xy, robot_yaw, cmds, horizon)
+        paths_t, end_xy_t = rollout_cmds_batched_paths(robot_xy, robot_yaw, cmds, horizon)
+        _, end_yaw_t      = rollout_cmds_batched(robot_xy, robot_yaw, cmds, horizon)
+        coll_np    = path_collision_penalty_batched(sm, paths_t.cpu().numpy())
         end_dist_t = (end_xy_t - goal_t).norm(dim=1)
         end_ang_t  = torch.atan2(goal_t[1]-end_xy_t[:,1], goal_t[0]-end_xy_t[:,0])
         end_herr_t = ((end_ang_t - end_yaw_t + math.pi) % (2*math.pi) - math.pi).abs()
         geo_cost   = 0.75*end_dist_t + 0.30*end_herr_t
 
-        cost = energy_weight*eng + geo_cost
+        cost = energy_weight*eng + geo_cost + torch.from_numpy(coll_np).to(dev)
         if prev_cmd is not None:
             cost = cost + 0.10*(cmds - prev_cmd).pow(2).sum(dim=-1)
 
@@ -799,17 +801,27 @@ def plan_explore_cmd(jepa, head, zc, z_explore, sm, robot_xy, robot_yaw, frontie
 # Waypoint detection
 # --------------------------------------------------------------------------- #
 
-def check_detections(robot_xy, robot_yaw, waypoints, found, seeking_idx):
+def has_line_of_sight(sm, from_xy, to_xy, n_samples=16):
+    """Return True if no OCCUPIED cell blocks the straight line from_xy → to_xy."""
+    for t in np.linspace(0.08, 0.92, n_samples):
+        pt = from_xy + t * (to_xy - from_xy)
+        if sample_cell(sm, pt) == MAP_OCC:
+            return False
+    return True
+
+
+def check_detections(robot_xy, robot_yaw, waypoints, found, seeking_idx,
+                     sm, seek_timeout_cd):
     """Return index of first undetected/unsought waypoint now in FOV, or None."""
     for i, wp in enumerate(waypoints):
-        if found[i] or i == seeking_idx:
+        if found[i] or i == seeking_idx or seek_timeout_cd[i] > 0:
             continue
         vec  = wp.pos - robot_xy
         dist = float(np.linalg.norm(vec))
         if dist > DETECT_DIST:
             continue
         bearing = wrap_to_pi(math.atan2(float(vec[1]), float(vec[0])) - robot_yaw)
-        if abs(bearing) <= DETECT_FOV:
+        if abs(bearing) <= DETECT_FOV and has_line_of_sight(sm, robot_xy, wp.pos):
             return i
     return None
 
@@ -1005,10 +1017,11 @@ def main():
     recent_pos: Deque[np.ndarray] = deque(maxlen=18)
     recent_cov: Deque[float]      = deque(maxlen=40)
 
-    found       = [False] * len(waypoints)     # claimed
-    seeking_idx = -1                            # index of beacon being sought (-1 = explore)
-    seek_steps  = 0
-    seek_ema_e  = 4.0
+    found            = [False] * len(waypoints)  # claimed
+    seeking_idx      = -1                         # index of beacon being sought (-1 = explore)
+    seek_steps       = 0
+    seek_ema_e       = 4.0
+    seek_timeout_cd  = [0] * len(waypoints)       # per-waypoint cooldown after timeout
 
     frontier_xy       = np.array([0.5, 0.5], np.float32)
     frontier_age      = 0
@@ -1058,7 +1071,9 @@ def main():
         recent_cov.append(cov)
 
         # ── Waypoint detection ─────────────────────────────────────────── #
-        detected = check_detections(robot_xy, robot_yaw, waypoints, found, seeking_idx)
+        seek_timeout_cd = [max(0, c - 1) for c in seek_timeout_cd]
+        detected = check_detections(robot_xy, robot_yaw, waypoints, found, seeking_idx,
+                                    sm, seek_timeout_cd)
         if detected is not None and seeking_idx < 0:
             seeking_idx = detected
             seek_steps  = 0
@@ -1115,6 +1130,7 @@ def main():
             if seek_steps > MAX_SEEK_STEPS:
                 print(f"\n  [TIMEOUT] Gave up seeking {waypoints[seeking_idx].name} "
                       f"at step {step} — resuming exploration")
+                seek_timeout_cd[seeking_idx] = 350   # don't re-detect for 350 steps
                 seeking_idx = -1; prev_cmd = None
 
         # ── Command selection ──────────────────────────────────────────── #
@@ -1132,7 +1148,7 @@ def main():
             gang    = math.atan2(float(gvec[1]), float(gvec[0]))
             herr    = wrap_to_pi(gang - robot_yaw)
             cmd, plan_path = plan_seek_cmd(
-                jepa, head, z_current, z_goal,
+                jepa, head, z_current, z_goal, sm,
                 robot_xy, robot_yaw, wp.pos, gbody,
                 gdist, herr, args.cands, args.horizon, dev, prev_cmd,
             )
