@@ -1,0 +1,1177 @@
+#!/usr/bin/env python3
+"""
+JEPA v2 — Maze Explorer with Goal Discovery
+
+The robot explores a 4-room maze using frontier-based navigation.
+When it turns a corner and geometrically "sees" a hidden beacon (within its
+forward field-of-view), it switches into energy-guided goal-seek mode and
+navigates to claim the waypoint.  Afterwards it resumes exploration.
+
+Maze layout (top-down, y up):
+  ┌──────┬──────┬──────┐
+  │  W2  │alcove│  W3  │  y ≈ 3.8
+  │ (NW) │  W5  │ (NE) │
+  ├──  ──┘  ──  └──  ──┤  y ≈ 1.6  (gaps in vertical walls)
+  │     centre          │
+  ├──  ──┐  ──  ┌──  ──┤  y ≈ 0.6
+  │  W1  │  S   │  W4  │
+  │ (SW) │start │ (SE) │  y ≈ -1.2
+  └──────┴──────┴──────┘
+   x≈-2.2  x=0  x=2   x≈3.8
+
+Usage:
+    python scripts/7_maze_explorer.py \\
+        --jepa_ckpt jepa_checkpoints/epoch_17.pt \\
+        --head_ckpt energy_head_checkpoints/energy_head_best.pt \\
+        --ppo_ckpt  models/ppo/ckpt_20000.pt
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import sys
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Deque, Dict, List, Optional, Tuple
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+import imageio
+import numpy as np
+import torch
+from PIL import Image, ImageDraw
+import genesis as gs
+
+from tqjepa.models import CanonicalJEPA, GoalEnergyHead, ActorCritic
+from tqjepa.math_utils import (
+    clamp, wrap_to_pi, yaw_to_quat, body_to_world_xy,
+    world_to_body_xy, forward_up_from_quat, world_to_body_vec,
+)
+from tqjepa.genesis_utils import init_genesis_once, to_genesis_target, to_numpy
+from tqjepa.checkpoint_utils import load_jepa_checkpoint, load_ppo_checkpoint, clean_state_dict
+from tqjepa.texture_utils import make_checkerboard
+
+
+# --------------------------------------------------------------------------- #
+# World constants
+# --------------------------------------------------------------------------- #
+
+WORLD_MIN = np.array([-2.2, -1.2], dtype=np.float32)
+WORLD_MAX = np.array([ 3.8,  3.8], dtype=np.float32)
+
+MAP_UNKNOWN, MAP_FREE, MAP_OCC = -1, 0, 1
+
+JOINTS_ACTUATED = [
+    "lf_hip_joint",  "lh_hip_joint",  "rf_hip_joint",  "rh_hip_joint",
+    "lf_thigh_joint","lh_thigh_joint","rf_thigh_joint","rh_thigh_joint",
+    "lf_calf_joint", "lh_calf_joint", "rf_calf_joint", "rh_calf_joint",
+]
+Q0_VALUES = np.array([
+     0.06,  0.06, -0.06, -0.06,
+     0.85,  0.85,  0.85,  0.85,
+    -1.75, -1.75, -1.75, -1.75,
+], dtype=np.float32)
+URDF_PATH  = "assets/mini_pupper/mini_pupper.urdf"
+ROBOT_SPAWN = (0.5, -0.5, 0.12)
+
+# Detection thresholds for "seeing" a waypoint.
+DETECT_DIST  = 1.8   # metres
+DETECT_FOV   = 0.70  # radians half-angle (≈ 40°); robot must roughly face the beacon
+ARRIVE_DIST  = 0.45  # metres — waypoint claimed
+MAX_SEEK_STEPS = 500 # give up seeking after this many steps (back to explore)
+
+
+# --------------------------------------------------------------------------- #
+# Maze wall + waypoint definitions
+# --------------------------------------------------------------------------- #
+
+# Each entry: (centre_xyz, size_xyz, colour_rgb)
+MAZE_WALL_SPECS: List[Tuple] = [
+    # ── Left corridor wall at x = 0 ──
+    # South section: covers y ∈ [-1.2, 0.6]
+    ((0.0, -0.3,  0.4), (0.15, 1.8, 0.8), (0.55, 0.55, 0.60)),
+    # North section: covers y ∈ [1.6, 3.8]
+    ((0.0,  2.7,  0.4), (0.15, 2.2, 0.8), (0.55, 0.55, 0.60)),
+    # Gap: y ∈ [0.6, 1.6] → 1 m passage into west rooms.
+
+    # ── Right corridor wall at x = 2 ──
+    # South section: covers y ∈ [-1.2, 0.6]
+    ((2.0, -0.3,  0.4), (0.15, 1.8, 0.8), (0.55, 0.55, 0.60)),
+    # North section: covers y ∈ [1.6, 3.8]
+    ((2.0,  2.7,  0.4), (0.15, 2.2, 0.8), (0.55, 0.55, 0.60)),
+    # Gap: y ∈ [0.6, 1.6] → 1 m passage into east rooms.
+
+    # ── Alcove wall at y = 2.8, x ∈ [0.8, 2.0] ──
+    # Hides W5 in the top-centre alcove; gap at x ∈ [0, 0.8].
+    ((1.4,  2.8,  0.4), (1.2, 0.15, 0.8), (0.55, 0.55, 0.60)),
+]
+
+
+@dataclass(frozen=True)
+class MazeWaypoint:
+    name:         str
+    pos:          np.ndarray       # (x, y) arrival position
+    approach_dir: np.ndarray       # unit vector: direction robot moves when approaching
+    panel_pos:    Tuple            # (x, y, z) — Genesis box centre for the visible beacon
+    panel_size:   Tuple            # (sx, sy, sz)
+    color_rgb:    Tuple            # (r, g, b) for beacon surface + HUD
+
+
+def make_maze_waypoints() -> List[MazeWaypoint]:
+    return [
+        MazeWaypoint(
+            name="W1-RED",
+            pos=np.array([-1.4,  0.2], dtype=np.float32),
+            approach_dir=np.array([-1.0,  0.0], dtype=np.float32),  # enters from east, faces west
+            panel_pos=(-2.15,  0.2,  0.55),
+            panel_size=(0.12, 0.9, 1.1),
+            color_rgb=(0.92, 0.15, 0.15),
+        ),
+        MazeWaypoint(
+            name="W2-GREEN",
+            pos=np.array([-1.4,  2.8], dtype=np.float32),
+            approach_dir=np.array([-1.0,  0.0], dtype=np.float32),  # NW room, faces west
+            panel_pos=(-2.15,  2.8,  0.55),
+            panel_size=(0.12, 0.9, 1.1),
+            color_rgb=(0.15, 0.88, 0.15),
+        ),
+        MazeWaypoint(
+            name="W3-BLUE",
+            pos=np.array([ 3.2,  2.8], dtype=np.float32),
+            approach_dir=np.array([ 1.0,  0.0], dtype=np.float32),  # NE room, faces east
+            panel_pos=( 3.75,  2.8,  0.55),
+            panel_size=(0.12, 0.9, 1.1),
+            color_rgb=(0.15, 0.30, 0.92),
+        ),
+        MazeWaypoint(
+            name="W4-YELLOW",
+            pos=np.array([ 3.2,  0.2], dtype=np.float32),
+            approach_dir=np.array([ 1.0,  0.0], dtype=np.float32),  # SE room, faces east
+            panel_pos=( 3.75,  0.2,  0.55),
+            panel_size=(0.12, 0.9, 1.1),
+            color_rgb=(0.95, 0.90, 0.10),
+        ),
+        MazeWaypoint(
+            name="W5-PURPLE",
+            pos=np.array([ 1.0,  3.4], dtype=np.float32),
+            approach_dir=np.array([ 0.0,  1.0], dtype=np.float32),  # hidden alcove, faces north
+            panel_pos=( 1.0,  3.78, 0.55),
+            panel_size=(0.9, 0.12, 1.1),
+            color_rgb=(0.80, 0.10, 0.90),
+        ),
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Scene construction
+# --------------------------------------------------------------------------- #
+
+def build_scene(waypoints: List[MazeWaypoint]):
+    scene = gs.Scene(show_viewer=False)
+
+    tex = make_checkerboard(grid=12, path="maze_checker.png")
+    scene.add_entity(
+        gs.morphs.Plane(),
+        surface=gs.surfaces.Rough(
+            diffuse_texture=gs.textures.ImageTexture(image_path=tex),
+        ),
+    )
+
+    robot = scene.add_entity(
+        gs.morphs.URDF(file=URDF_PATH, pos=ROBOT_SPAWN, fixed=False),
+    )
+
+    # Maze walls.
+    for (cpos, csz, ccol) in MAZE_WALL_SPECS:
+        scene.add_entity(
+            gs.morphs.Box(pos=cpos, size=csz, fixed=True),
+            surface=gs.surfaces.Rough(color=ccol),
+        )
+
+    # Waypoint beacon panels.
+    for wp in waypoints:
+        scene.add_entity(
+            gs.morphs.Box(pos=wp.panel_pos, size=wp.panel_size, fixed=True),
+            surface=gs.surfaces.Rough(color=wp.color_rgb),
+        )
+
+    cam_brain = scene.add_camera(res=(64, 64),   fov=58)
+    cam_eye   = scene.add_camera(res=(384, 384), fov=58)
+    cam_over  = scene.add_camera(res=(512, 512), fov=55)
+
+    scene.build()
+
+    dofs = [robot.get_joint(jn).dofs_idx_local[0] for jn in JOINTS_ACTUATED]
+    q0   = torch.tensor(Q0_VALUES, device=gs.device, dtype=torch.float32)
+
+    robot.set_pos(np.array(ROBOT_SPAWN, dtype=np.float32))
+    robot.set_quat(yaw_to_quat(math.pi / 2))   # spawn facing north
+    robot.set_dofs_position(Q0_VALUES, dofs)
+    robot.set_dofs_kp(torch.ones(12, device=gs.device) * 5.0, dofs)
+    robot.set_dofs_kv(torch.ones(12, device=gs.device) * 0.5, dofs)
+
+    return scene, robot, cam_brain, cam_eye, cam_over, dofs, q0
+
+
+# --------------------------------------------------------------------------- #
+# Observation helpers  (identical to explore demo)
+# --------------------------------------------------------------------------- #
+
+def move_cams(robot, cam_brain, cam_eye, cam_over):
+    p = to_numpy(robot.get_pos())
+    q = to_numpy(robot.get_quat())
+    if p.ndim > 1: p = p[0]
+    if q.ndim > 1: q = q[0]
+    fw, up = forward_up_from_quat(q)
+    brain_pos = p + fw * 0.10 + up * 0.05
+    brain_lk  = brain_pos + fw * 1.0
+    cam_brain.set_pose(pos=brain_pos, lookat=brain_lk, up=up)
+    cam_eye.set_pose(pos=brain_pos, lookat=brain_lk, up=up)
+    over_pos = p - fw * 1.8 + np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    over_lk  = p + fw * 0.45
+    cam_over.set_pose(pos=over_pos, lookat=over_lk,
+                      up=np.array([0.0, 0.0, 1.0], dtype=np.float32))
+    yaw = math.atan2(float(fw[1]), float(fw[0]))
+    return p, yaw
+
+
+def render_rgb(cam) -> np.ndarray:
+    """Return HxWx3 uint8 RGB from any Genesis camera."""
+    out = cam.render()
+    arr = None
+    if isinstance(out, (tuple, list)):
+        for item in out:
+            a = np.asarray(to_numpy(item))
+            if a.ndim == 3 and a.shape[-1] >= 3:
+                arr = a[..., :3]; break
+    elif isinstance(out, dict):
+        for k in ("rgb", "color", "image"):
+            if k in out:
+                arr = np.asarray(out[k])[..., :3]; break
+    else:
+        arr = np.asarray(to_numpy(out))[..., :3]
+    if arr is None:
+        raise RuntimeError("Camera render failed")
+    if arr.dtype != np.uint8:
+        mx = float(np.nanmax(arr)) if arr.size else 1.0
+        arr = np.clip(arr * (255.0 / mx if mx > 1.0 else 255.0), 0, 255).astype(np.uint8)
+    return arr
+
+
+def render_rgb_depth(cam) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Attempt to render RGB + depth; fall back to RGB-only if depth unavailable."""
+    rgb = None; depth = None
+    for fn in (lambda: cam.render(rgb=True, depth=True),
+               lambda: cam.render(depth=True),
+               lambda: cam.render()):
+        try:
+            out = fn(); break
+        except Exception:
+            pass
+    else:
+        raise RuntimeError("Camera render failed entirely")
+
+    def absorb(a):
+        nonlocal rgb, depth
+        a = np.asarray(a)
+        if a.ndim == 3 and a.shape[-1] >= 3 and rgb is None:
+            rgb = a[..., :3].copy(); return
+        if (a.ndim == 2 or (a.ndim == 3 and a.shape[-1] == 1)) and depth is None:
+            depth = (a[..., 0] if a.ndim == 3 else a).copy(); return
+
+    if isinstance(out, dict):
+        for k in ("rgb","color","image"): out.get(k) is not None and absorb(out[k])
+        out.get("depth") is not None and absorb(out["depth"])
+    elif isinstance(out, (tuple, list)):
+        for item in out:
+            if item is not None: absorb(to_numpy(item))
+    else:
+        absorb(to_numpy(out))
+
+    if rgb is None: raise RuntimeError("No RGB from camera")
+    if rgb.dtype != np.uint8:
+        mx = float(np.nanmax(rgb)) if rgb.size else 1.0
+        rgb = np.clip(rgb * (255.0/mx if mx > 1.0 else 255.0), 0, 255).astype(np.uint8)
+    if depth is not None:
+        depth = np.asarray(depth, dtype=np.float32)
+    return rgb, depth
+
+
+def get_sys1_obs(robot, q0, prev_action, cmd, dofs, dev):
+    pos  = robot.get_pos().to(dev); quat = robot.get_quat().to(dev)
+    vel  = robot.get_vel().to(dev); ang  = robot.get_ang().to(dev)
+    pos, quat, vel, ang = [x.unsqueeze(0) if x.dim()==1 else x
+                           for x in (pos, quat, vel, ang)]
+    q  = robot.get_dofs_position(dofs).to(dev)
+    dq = robot.get_dofs_velocity(dofs).to(dev)
+    q  = q.unsqueeze(0) if q.dim()==1 else q
+    dq = dq.unsqueeze(0) if dq.dim()==1 else dq
+    return torch.cat([
+        pos[:, 2:3], quat,
+        world_to_body_vec(quat, vel), world_to_body_vec(quat, ang),
+        q - q0.unsqueeze(0), dq, prev_action, cmd,
+    ], dim=1)
+
+
+@torch.no_grad()
+def get_jepa_state(robot, cam_brain, q0, prev_action, dofs, dev):
+    rgb, depth = render_rgb_depth(cam_brain)
+    chw = np.transpose(rgb[:, :, :3], (2, 0, 1)).copy()
+    vis = torch.from_numpy(chw).float().to(dev).unsqueeze(0) / 255.0
+    obs = get_sys1_obs(robot, q0, prev_action,
+                       torch.zeros((1, 3), device=dev), dofs, dev)
+    prop = obs[:, :47]
+    return vis, prop, rgb, depth
+
+
+# --------------------------------------------------------------------------- #
+# Sensor map  (copied from explore demo)
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class SensorMap:
+    grid:        np.ndarray
+    free_visits: np.ndarray
+    res:         float
+
+    @property
+    def h(self): return int(self.grid.shape[0])
+    @property
+    def w(self): return int(self.grid.shape[1])
+
+
+def make_sensor_map(res: float) -> SensorMap:
+    w = int(math.ceil((WORLD_MAX[0]-WORLD_MIN[0]) / res))
+    h = int(math.ceil((WORLD_MAX[1]-WORLD_MIN[1]) / res))
+    return SensorMap(np.full((h,w), MAP_UNKNOWN, np.int8),
+                     np.zeros((h,w), np.int32), float(res))
+
+def world_to_grid(sm, xy):
+    gx = int((float(xy[0])-float(WORLD_MIN[0])) / sm.res)
+    gy = int((float(xy[1])-float(WORLD_MIN[1])) / sm.res)
+    return (gy, gx) if 0<=gx<sm.w and 0<=gy<sm.h else None
+
+def grid_to_world(sm, rc):
+    r,c = int(rc[0]), int(rc[1])
+    return np.array([float(WORLD_MIN[0])+(c+0.5)*sm.res,
+                     float(WORLD_MIN[1])+(r+0.5)*sm.res], dtype=np.float32)
+
+def mark_disc(sm, xy, radius, value):
+    g = world_to_grid(sm, xy)
+    if g is None: return
+    rr = max(1, int(radius/sm.res))
+    r0,c0 = g
+    for r in range(max(0,r0-rr), min(sm.h,r0+rr+1)):
+        for c in range(max(0,c0-rr), min(sm.w,c0+rr+1)):
+            p = grid_to_world(sm, (r,c))
+            if float(np.linalg.norm(p - xy[:2])) <= radius:
+                if value == MAP_FREE:
+                    if sm.grid[r,c] != MAP_OCC:
+                        sm.grid[r,c] = MAP_FREE; sm.free_visits[r,c] += 1
+                elif value == MAP_OCC:
+                    sm.grid[r,c] = MAP_OCC
+
+def sample_cell(sm, xy):
+    g = world_to_grid(sm, xy)
+    return MAP_OCC if g is None else int(sm.grid[g[0],g[1]])
+
+def coverage_percent(sm):
+    return 100.0 * float(np.count_nonzero(sm.grid != MAP_UNKNOWN)) / float(sm.grid.size)
+
+def update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth_img, fov_deg, depth_max):
+    mark_disc(sm, robot_xy, 0.20, MAP_FREE)
+    def norm_d(d):
+        if d is None: return None
+        d = np.asarray(d, np.float32)
+        if d.ndim == 3: d = d[...,0]
+        if not np.isfinite(d).any(): return None
+        d = np.where(np.isfinite(d), d, np.nan)
+        mx, mn = float(np.nanmax(d)), float(np.nanmin(d))
+        d = np.clip(d,0,1)*depth_max if mx<=1.05 and mn>=0 else np.clip(d,0,depth_max)
+        return np.nan_to_num(d, nan=depth_max, posinf=depth_max).astype(np.float32)
+
+    d = norm_d(depth_img)
+    if d is None:
+        for a in np.linspace(-0.35, 0.35, 11):
+            ry = robot_yaw + float(a)
+            for t in np.linspace(0.08, 0.55, 8):
+                mark_disc(sm, robot_xy + np.array([math.cos(ry), math.sin(ry)],
+                               np.float32) * float(t), 0.05, MAP_FREE)
+        return
+    h, w = d.shape
+    cols = np.unique(np.clip(np.linspace(int(0.08*w), int(0.92*w), 41).astype(int), 0, w-1))
+    for c in cols:
+        ray = d[int(0.42*h):int(0.88*h), c]
+        if not ray.size: continue
+        dist = float(clamp(float(np.nanmedian(ray)), 0.05, depth_max))
+        x_norm = (float(c)/max(float(w-1),1.0))*2.0-1.0
+        ray_yaw = robot_yaw + math.radians(0.5*fov_deg)*x_norm
+        free_until = max(0.0, dist-0.08)
+        for t in np.linspace(0.06, free_until, max(2, int(free_until/max(sm.res*0.7,0.04)))):
+            mark_disc(sm, robot_xy + np.array([math.cos(ray_yaw), math.sin(ray_yaw)],
+                           np.float32)*float(t), 0.04, MAP_FREE)
+        if dist < depth_max * 0.96:
+            mark_disc(sm, robot_xy + np.array([math.cos(ray_yaw), math.sin(ray_yaw)],
+                           np.float32)*float(dist), 0.08, MAP_OCC)
+
+
+def select_frontier(sm, robot_xy, blacklist=None, bl_radius=0.40):
+    bl = blacklist or []
+    cands = []
+    for r in range(1, sm.h-1):
+        for c in range(1, sm.w-1):
+            if sm.grid[r,c] != MAP_FREE: continue
+            unk = sum(1 for rr in range(r-1,r+2) for cc in range(c-1,c+2)
+                      if not (rr==r and cc==c) and sm.grid[rr,cc]==MAP_UNKNOWN)
+            if not unk: continue
+            occ = sum(1 for rr in range(r-1,r+2) for cc in range(c-1,c+2)
+                      if not (rr==r and cc==c) and sm.grid[rr,cc]==MAP_OCC)
+            wp = grid_to_world(sm, (r,c))
+            dist = float(np.linalg.norm(wp - robot_xy))
+            if dist < 0.20: continue
+            if any(float(np.linalg.norm(wp-bp)) < bl_radius for bp in bl): continue
+            cands.append((0.45*float(unk) - 0.30*dist - 0.35*float(occ), wp))
+    if not cands:
+        return (select_frontier(sm, robot_xy) if bl else (robot_xy.copy(), 0.0))
+    cands.sort(key=lambda x: x[0], reverse=True)
+    return cands[0][1], cands[0][0]
+
+
+# --------------------------------------------------------------------------- #
+# Kinematic rollout helpers
+# --------------------------------------------------------------------------- #
+
+def rollout_cmds_batched(start_xy, start_yaw, cmds, horizon, dt=0.10):
+    """Return (end_xy_t, end_yaw_t), both (N,) / (N,2)."""
+    N   = cmds.shape[0]
+    px  = cmds.new_full((N,), float(start_xy[0]))
+    py  = cmds.new_full((N,), float(start_xy[1]))
+    yaw = cmds.new_full((N,), float(start_yaw))
+    vx, vy, wyaw = cmds[:,0], cmds[:,1], cmds[:,2]
+    for _ in range(horizon):
+        cy, sy = torch.cos(yaw), torch.sin(yaw)
+        px  = px  + dt*(cy*vx - sy*vy)
+        py  = py  + dt*(sy*vx + cy*vy)
+        yaw = yaw + dt*wyaw
+    return torch.stack([px, py], dim=1), yaw
+
+
+def rollout_cmds_batched_paths(start_xy, start_yaw, cmds, horizon, dt=0.10):
+    """Return (paths_t (N,hz,2), end_xy_t (N,2))."""
+    N   = cmds.shape[0]
+    px  = cmds.new_full((N,), float(start_xy[0]))
+    py  = cmds.new_full((N,), float(start_xy[1]))
+    yaw = cmds.new_full((N,), float(start_yaw))
+    vx, vy, wyaw = cmds[:,0], cmds[:,1], cmds[:,2]
+    xs, ys = [], []
+    for _ in range(horizon):
+        xs.append(px); ys.append(py)
+        cy, sy = torch.cos(yaw), torch.sin(yaw)
+        px  = px  + dt*(cy*vx - sy*vy)
+        py  = py  + dt*(sy*vx + cy*vy)
+        yaw = yaw + dt*wyaw
+    return torch.stack([torch.stack(xs,1), torch.stack(ys,1)], 2), torch.stack([px,py],1)
+
+
+def path_collision_penalty_batched(sm, paths_np):
+    N, hz, _ = paths_np.shape
+    pts = paths_np.reshape(-1, 2)
+    gx = np.clip(((pts[:,0]-float(WORLD_MIN[0]))/sm.res).astype(np.int32), 0, sm.w-1)
+    gy = np.clip(((pts[:,1]-float(WORLD_MIN[1]))/sm.res).astype(np.int32), 0, sm.h-1)
+    pen = (sm.grid[gy,gx]==MAP_OCC).astype(np.float32)*1.8
+    for dr,dc in ((-1,0),(1,0),(0,-1),(0,1)):
+        gyn = np.clip(gy+dr,0,sm.h-1); gxn = np.clip(gx+dc,0,sm.w-1)
+        pen += (sm.grid[gyn,gxn]==MAP_OCC).astype(np.float32)*0.015
+    return pen.reshape(N,hz).sum(axis=1)
+
+
+def local_unknown_gain_batched(sm, end_xy, radius=0.55):
+    N = end_xy.shape[0]
+    gx0 = ((end_xy[:,0]-float(WORLD_MIN[0]))/sm.res).astype(np.int32)
+    gy0 = ((end_xy[:,1]-float(WORLD_MIN[1]))/sm.res).astype(np.int32)
+    rr = max(1, int(radius/sm.res))
+    counts = np.zeros(N, np.float32)
+    for dr in range(-rr, rr+1):
+        for dc in range(-rr, rr+1):
+            gyn = gy0+dr; gxn = gx0+dc
+            valid = (gyn>=0)&(gyn<sm.h)&(gxn>=0)&(gxn<sm.w)
+            px = float(WORLD_MIN[0])+(gxn+0.5)*sm.res
+            py = float(WORLD_MIN[1])+(gyn+0.5)*sm.res
+            in_r = np.sqrt((px-end_xy[:,0])**2+(py-end_xy[:,1])**2)<=radius
+            gyn_c = np.clip(gyn,0,sm.h-1); gxn_c = np.clip(gxn,0,sm.w-1)
+            counts += (valid & in_r & (sm.grid[gyn_c,gxn_c]==MAP_UNKNOWN)).astype(np.float32)
+    return counts * 0.08
+
+
+# --------------------------------------------------------------------------- #
+# Breadcrumb harvesting  (single approach direction per waypoint)
+# --------------------------------------------------------------------------- #
+
+@torch.no_grad()
+def harvest_breadcrumb(
+    robot, cam_brain, q0, jepa, ppo, dofs, dev, scene, wp: MazeWaypoint,
+    n_avg=5, warmup=10, speed=0.25, start_offset=0.45,
+) -> Tuple[np.ndarray, torch.Tensor]:
+    """Encode goal latents from 4 cardinal approach directions.
+
+    Returns (dirs_np (K,2), latents (K,D)) for dynamic direction selection
+    at runtime.  Uses target encoder so latents are in the same space the
+    energy head was trained against.
+    """
+    primary = wp.approach_dir / max(float(np.linalg.norm(wp.approach_dir)), 1e-8)
+    dir_list = [
+        primary,
+        np.array([-primary[1],  primary[0]], np.float32),
+        np.array([ primary[1], -primary[0]], np.float32),
+        -primary,
+    ]
+
+    latents = []
+    for d in dir_list:
+        start_xy  = wp.pos - start_offset * d
+        start_yaw = math.atan2(float(d[1]), float(d[0]))
+
+        robot.set_pos(np.array([start_xy[0], start_xy[1], 0.12], np.float32))
+        robot.set_quat(yaw_to_quat(start_yaw))
+        robot.set_dofs_position(q0.detach().cpu().numpy(), dofs)
+        for _ in range(8): scene.step()
+
+        pa  = torch.zeros((1,12), device=dev)
+        cmd = torch.tensor([[speed, 0.0, 0.0]], device=dev)
+        for _ in range(warmup):
+            obs = get_sys1_obs(robot, q0, pa, cmd, dofs, dev)
+            pa  = ppo.act_deterministic(obs)
+            robot.control_dofs_position(to_genesis_target(q0 + 0.3*pa[0]), dofs)
+            for _ in range(4): scene.step()
+
+        zs = []
+        for _ in range(n_avg):
+            obs = get_sys1_obs(robot, q0, pa, cmd, dofs, dev)
+            pa  = ppo.act_deterministic(obs)
+            robot.control_dofs_position(to_genesis_target(q0 + 0.3*pa[0]), dofs)
+            for _ in range(4): scene.step()
+            vis, prop, _, _ = get_jepa_state(robot, cam_brain, q0, pa, dofs, dev)
+            zs.append(jepa.encode_target(vis, prop).detach())
+        latents.append(torch.stack(zs).mean(0))
+
+    dirs_np  = np.stack(dir_list, axis=0)              # (K,2)
+    latents_t = torch.stack(latents, dim=0).squeeze(1) # (K,D)
+    return dirs_np, latents_t
+
+
+# --------------------------------------------------------------------------- #
+# Goal-directed planner  (from 5_genesis_eval.py with heading improvements)
+# --------------------------------------------------------------------------- #
+
+@torch.no_grad()
+def plan_seek_cmd(
+    jepa, head, z_current, z_goal, robot_xy, robot_yaw, goal_xy,
+    goal_body_xy, dist_to_goal, heading_error, n_candidates, horizon, dev,
+    prev_cmd=None,
+):
+    """CEM planner for goal-seeking (energy + geometry).  z_goal: (1,D)."""
+    far = dist_to_goal > 0.9
+    speed_scale = float(np.clip(dist_to_goal / 0.9, 0.2, 1.0))
+    vx_clamp    = float(np.clip(dist_to_goal * 0.55, 0.15, 0.40))
+
+    if abs(heading_error) > math.pi * 0.55:
+        mean = torch.tensor([0.0, 0.0, math.copysign(0.75, heading_error)],
+                            device=dev, dtype=torch.float32)
+        std  = torch.tensor([0.04, 0.04, 0.15], device=dev, dtype=torch.float32)
+    else:
+        ts = (0.30 if far else 0.18) * speed_scale
+        if abs(heading_error) > 0.65: ts *= 0.35
+        mean = torch.tensor([
+            clamp(float(goal_body_xy[0])*ts, -0.35, 0.35),
+            clamp(float(goal_body_xy[1])*ts, -0.20, 0.20),
+            clamp(0.65*heading_error, -0.72, 0.72),
+        ], device=dev, dtype=torch.float32)
+        std = torch.tensor([
+            (0.12 if far else 0.09)*speed_scale,
+            (0.10 if far else 0.08)*speed_scale,
+            0.22 if far else 0.18,
+        ], device=dev, dtype=torch.float32)
+
+    best_cmd  = mean.view(1,3)
+    best_cost = None
+    best_path = None
+
+    energy_weight = float(np.clip((dist_to_goal-0.35)/0.65, 0.0, 1.0))
+
+    for _ in range(5):
+        cmds = mean + std * torch.randn((n_candidates,3), device=dev)
+        cmds[:,0].clamp_(-vx_clamp, vx_clamp)
+        cmds[:,1].clamp_(-0.25, 0.25)
+        cmds[:,2].clamp_(-0.80, 0.80)
+
+        z_roll = z_current.expand(n_candidates, -1)
+        h_t    = torch.zeros((n_candidates, jepa.latent_dim), device=dev, dtype=z_roll.dtype)
+        for _ in range(horizon):
+            z_roll, h_t = jepa.predictor(z_roll, cmds, h_t)
+
+        eng = head(z_roll, z_goal.expand_as(z_roll))
+
+        goal_t    = torch.tensor(goal_xy, device=dev, dtype=torch.float32)
+        end_xy_t, end_yaw_t = rollout_cmds_batched(robot_xy, robot_yaw, cmds, horizon)
+        end_dist_t = (end_xy_t - goal_t).norm(dim=1)
+        end_ang_t  = torch.atan2(goal_t[1]-end_xy_t[:,1], goal_t[0]-end_xy_t[:,0])
+        end_herr_t = ((end_ang_t - end_yaw_t + math.pi) % (2*math.pi) - math.pi).abs()
+        geo_cost   = 0.75*end_dist_t + 0.30*end_herr_t
+
+        cost = energy_weight*eng + geo_cost
+        if prev_cmd is not None:
+            cost = cost + 0.10*(cmds - prev_cmd).pow(2).sum(dim=-1)
+
+        k = max(n_candidates//10, 8)
+        elite = torch.topk(cost, k=k, largest=False).indices
+        mean  = cmds[elite].mean(0)
+        std   = cmds[elite].std(0) + 1e-4
+
+        ib = int(torch.argmin(cost).item())
+        if best_cost is None or float(cost[ib]) < best_cost:
+            best_cost = float(cost[ib])
+            best_cmd  = cmds[ib].view(1,3).detach().clone()
+            best_path, _, _ = _kin_path(robot_xy, robot_yaw,
+                                        cmds[ib].cpu().numpy(), horizon)
+
+    return best_cmd, best_path or np.zeros((horizon,2), np.float32)
+
+
+def _kin_path(start_xy, start_yaw, cmd, horizon, dt=0.10):
+    pos, yaw, path = np.array(start_xy, np.float32).copy(), float(start_yaw), []
+    for _ in range(horizon):
+        path.append(pos.copy())
+        pos += dt * body_to_world_xy(yaw, cmd[:2])
+        yaw  = wrap_to_pi(yaw + dt * float(cmd[2]))
+    return np.stack(path), pos, yaw
+
+
+# --------------------------------------------------------------------------- #
+# Exploration planner  (from 6_explore_demo.py)
+# --------------------------------------------------------------------------- #
+
+@torch.no_grad()
+def plan_explore_cmd(jepa, zc, sm, robot_xy, robot_yaw, frontier_xy,
+                     prev_cmd, cands, hz, dev):
+    """Frontier-directed CEM planner with collision awareness."""
+    goal_vec  = frontier_xy - robot_xy
+    goal_dist = float(np.linalg.norm(goal_vec))
+    if goal_dist < 1e-6:
+        return torch.zeros((1,3), device=dev), np.zeros((hz,2), np.float32)
+
+    goal_dir  = goal_vec / goal_dist
+    goal_body = world_to_body_xy(robot_yaw, goal_dir)
+    hdg_err   = wrap_to_pi(math.atan2(float(goal_vec[1]), float(goal_vec[0])) - robot_yaw)
+
+    far = goal_dist > 0.8
+    ts  = (0.32 if far else 0.22) * float(np.clip(goal_dist/0.9, 0.25, 1.0))
+    if abs(hdg_err) > 0.65: ts *= 0.35
+
+    if abs(hdg_err) > math.pi * 0.55:
+        mean = torch.tensor([0.0, 0.0, math.copysign(0.70, hdg_err)],
+                            device=dev, dtype=torch.float32)
+        std  = torch.tensor([0.04, 0.04, 0.15], device=dev, dtype=torch.float32)
+    else:
+        mean = torch.tensor([
+            clamp(float(goal_body[0])*ts, -0.40, 0.40),
+            clamp(float(goal_body[1])*ts, -0.20, 0.20),
+            clamp(0.55*hdg_err, -0.65, 0.65),
+        ], device=dev, dtype=torch.float32)
+        std = torch.tensor([
+            0.14 if far else 0.10,
+            0.11 if far else 0.08,
+            0.24 if far else 0.18,
+        ], device=dev, dtype=torch.float32)
+
+    z_ref = float(zc.norm(dim=-1).mean().item()) + 1e-6
+    best_cmd  = mean.view(1,3)
+    best_cost = None
+    best_path_np = None
+
+    for _ in range(4):
+        cmds = mean + std * torch.randn((cands,3), device=dev)
+        cmds[:,0].clamp_(-0.40, 0.40)
+        cmds[:,1].clamp_(-0.25, 0.25)
+        cmds[:,2].clamp_(-0.60, 0.60)
+
+        z_roll = zc.expand(cands, -1)
+        h_t    = torch.zeros((cands, jepa.latent_dim), device=dev, dtype=z_roll.dtype)
+        for _ in range(hz):
+            z_roll, h_t = jepa.predictor(z_roll, cmds, h_t)
+        lat_pen = ((z_roll.norm(dim=-1)/z_ref) - 1.5).clamp(min=0.0)*0.15
+
+        paths_t, end_xy_t = rollout_cmds_batched_paths(robot_xy, robot_yaw, cmds, hz)
+        paths_np = paths_t.cpu().numpy()
+        end_np   = end_xy_t.cpu().numpy()
+
+        prog_np  = (goal_dist - np.linalg.norm(end_np - frontier_xy, axis=1)).astype(np.float32)
+        front_np = local_unknown_gain_batched(sm, end_np)
+        coll_np  = path_collision_penalty_batched(sm, paths_np)
+
+        smooth = (torch.zeros(cands,device=dev) if prev_cmd is None
+                  else 0.10*(cmds-prev_cmd).pow(2).sum(dim=-1))
+        cost = (torch.from_numpy(coll_np).to(dev) + lat_pen + smooth
+                + (cmds[:,0]<-0.02).float()*0.08
+                - 3.0*torch.from_numpy(prog_np).to(dev)
+                - 0.80*torch.from_numpy(front_np).to(dev))
+
+        k = max(8, cands//10)
+        elite = torch.topk(cost, k=k, largest=False).indices
+        mean  = cmds[elite].mean(0)
+        std   = cmds[elite].std(0) + 1e-4
+
+        ib = int(torch.argmin(cost).item())
+        if best_cost is None or float(cost[ib]) < best_cost:
+            best_cost    = float(cost[ib])
+            best_cmd     = cmds[ib].detach().clone().view(1,3)
+            best_path_np = paths_np[ib]
+
+    return best_cmd, best_path_np if best_path_np is not None else np.zeros((hz,2), np.float32)
+
+
+# --------------------------------------------------------------------------- #
+# Waypoint detection
+# --------------------------------------------------------------------------- #
+
+def check_detections(robot_xy, robot_yaw, waypoints, found, seeking_idx):
+    """Return index of first undetected/unsought waypoint now in FOV, or None."""
+    for i, wp in enumerate(waypoints):
+        if found[i] or i == seeking_idx:
+            continue
+        vec  = wp.pos - robot_xy
+        dist = float(np.linalg.norm(vec))
+        if dist > DETECT_DIST:
+            continue
+        bearing = wrap_to_pi(math.atan2(float(vec[1]), float(vec[0])) - robot_yaw)
+        if abs(bearing) <= DETECT_FOV:
+            return i
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# HUD
+# --------------------------------------------------------------------------- #
+
+def _wp_to_map(wp_xy, mx, my, mw, mh):
+    nx = (float(wp_xy[0])-float(WORLD_MIN[0])) / max(float(WORLD_MAX[0]-WORLD_MIN[0]),1e-8)
+    ny = (float(wp_xy[1])-float(WORLD_MIN[1])) / max(float(WORLD_MAX[1]-WORLD_MIN[1]),1e-8)
+    return (mx+int(np.clip(nx,0,1)*mw), my+mh-int(np.clip(ny,0,1)*mh))
+
+
+def draw_minimap(draw, sm, robot_xy, robot_yaw, target_xy, trail, plan_path,
+                 waypoints, found, seeking_idx,
+                 mx=512, my=370, mw=340, mh=140):
+    draw.rectangle([mx, my, mx+mw, my+mh], fill=(18,18,18), outline=(95,95,95))
+
+    for r in range(sm.h):
+        for c in range(sm.w):
+            x0 = mx+int(c/sm.w*mw); y0 = my+int(r/sm.h*mh)
+            x1 = mx+int((c+1)/sm.w*mw); y1 = my+int((r+1)/sm.h*mh)
+            v = int(sm.grid[r,c])
+            fill = (48,48,48) if v==MAP_FREE else (180,70,70) if v==MAP_OCC else (25,25,25)
+            draw.rectangle([x0,y0,x1,y1], fill=fill)
+
+    if len(trail) > 1:
+        pts = [_wp_to_map(t,mx,my,mw,mh) for t in trail[-300:]]
+        draw.line(pts, fill=(255,220,80), width=2)
+
+    if plan_path is not None and len(plan_path) > 1:
+        pts = [_wp_to_map(t,mx,my,mw,mh) for t in plan_path]
+        draw.line(pts, fill=(0,170,255), width=3)
+
+    # Waypoint markers.
+    for i, wp in enumerate(waypoints):
+        px, py = _wp_to_map(wp.pos, mx, my, mw, mh)
+        r_int = tuple(int(x*255) for x in wp.color_rgb)
+        if found[i]:
+            draw.ellipse([px-6,py-6,px+6,py+6], fill=r_int, outline=(255,255,255), width=2)
+        elif i == seeking_idx:
+            draw.ellipse([px-7,py-7,px+7,py+7], fill=r_int, outline=(255,255,0), width=3)
+        else:
+            draw.ellipse([px-4,py-4,px+4,py+4], fill=(60,60,60), outline=(120,120,120), width=1)
+
+    # Active target marker (frontier or waypoint).
+    tx, ty = _wp_to_map(target_xy, mx, my, mw, mh)
+    draw.ellipse([tx-5,ty-5,tx+5,ty+5], fill=(255,255,255), outline=(10,10,10), width=2)
+
+    # Robot.
+    rx, ry = _wp_to_map(robot_xy, mx, my, mw, mh)
+    fw = np.array([math.cos(robot_yaw), math.sin(robot_yaw)], np.float32)
+    lf = np.array([math.cos(robot_yaw+2.5), math.sin(robot_yaw+2.5)], np.float32)
+    rt = np.array([math.cos(robot_yaw-2.5), math.sin(robot_yaw-2.5)], np.float32)
+    s  = 10.0
+    tri = [(rx+int(fw[0]*s), ry-int(fw[1]*s)),
+           (rx+int(lf[0]*s*0.8), ry-int(lf[1]*s*0.8)),
+           (rx+int(rt[0]*s*0.8), ry-int(rt[1]*s*0.8))]
+    draw.polygon(tri, fill=(255,255,255), outline=(10,10,10))
+
+
+def compose_frame(over_rgb, eye_rgb, sm, robot_xy, robot_yaw, target_xy,
+                  trail, plan_path, waypoints, found, seeking_idx,
+                  status_lines):
+    canvas = Image.new("RGB", (896, 560), (20,20,20))
+    canvas.paste(Image.fromarray(over_rgb[:,:,:3].astype(np.uint8)), (0, 48))
+    canvas.paste(Image.fromarray(eye_rgb[:,:,:3].astype(np.uint8)).resize((384,384)), (512, 96))
+
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle([0,0,895,47], fill=(12,12,12), outline=(70,70,70))
+    draw.text((14,14), "JEPA v2 Maze Explorer — discover hidden beacons",
+              fill=(0,220,140))
+
+    draw.text((14,50), "World + follow view", fill=(190,190,190))
+    draw.text((526,78), "Robot eye view",     fill=(190,190,190))
+
+    for i, line in enumerate(status_lines):
+        draw.text((14, 510+14*i), line, fill=(200,200,200))
+
+    draw_minimap(draw, sm, robot_xy, robot_yaw, target_xy, trail, plan_path,
+                 waypoints, found, seeking_idx)
+    draw.text((512, 356), "Sensor map  (grey=free  red=occ  coloured=beacons)",
+              fill=(190,190,190))
+
+    # Legend for waypoints on right side.
+    for i, wp in enumerate(waypoints):
+        c = tuple(int(x*255) for x in wp.color_rgb)
+        lx, ly = 512, 480 + i*14
+        draw.rectangle([lx,ly,lx+10,ly+10], fill=c, outline=(180,180,180))
+        status = "FOUND" if found[i] else ("SEEKING" if i==seeking_idx else "hidden")
+        draw.text((lx+14, ly), f"{wp.name}: {status}", fill=(180,180,180))
+
+    return np.asarray(canvas)
+
+
+# --------------------------------------------------------------------------- #
+# PPO step helper
+# --------------------------------------------------------------------------- #
+
+@torch.no_grad()
+def ppo_step(scene, robot, q0, prev_action, cmd, dofs, ppo, dev):
+    obs    = get_sys1_obs(robot, q0, prev_action, cmd, dofs, dev)
+    action = ppo.act_deterministic(obs).detach()
+    robot.control_dofs_position(to_genesis_target(q0 + 0.3*action[0]), dofs)
+    for _ in range(4): scene.step()
+    return action
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+def main():
+    parser = argparse.ArgumentParser(description="JEPA v2 Maze Explorer")
+    parser.add_argument("--jepa_ckpt", required=True)
+    parser.add_argument("--head_ckpt", required=True)
+    parser.add_argument("--ppo_ckpt",  required=True)
+    parser.add_argument("--device",      default="cpu")
+    parser.add_argument("--sim_backend", default="auto")
+    parser.add_argument("--n_steps",     type=int,   default=4000)
+    parser.add_argument("--cands",       type=int,   default=512)
+    parser.add_argument("--horizon",     type=int,   default=15)
+    parser.add_argument("--map_res",     type=float, default=0.10)
+    parser.add_argument("--depth_max",   type=float, default=1.80)
+    parser.add_argument("--seed",        type=int,   default=0)
+    parser.add_argument("--no_video",    action="store_true")
+    parser.add_argument("--out", default="jepa_logs/maze_explorer.mp4")
+    args = parser.parse_args()
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    dev = torch.device("cpu" if args.device == "cuda" and
+                       not torch.cuda.is_available() else args.device)
+
+    # ── Load models ──────────────────────────────────────────────────────── #
+    init_genesis_once(args.sim_backend)
+
+    jepa = CanonicalJEPA().to(dev)
+    sd, _ = load_jepa_checkpoint(args.jepa_ckpt, device=dev)
+    jepa.load_state_dict(sd, strict=False)
+    jepa.eval()
+    print(f"Loaded CanonicalJEPA from {args.jepa_ckpt}")
+
+    head = GoalEnergyHead().to(dev)
+    hckpt = torch.load(args.head_ckpt, map_location=dev)
+    key   = "energy_head_state_dict" if "energy_head_state_dict" in hckpt else "model_state_dict"
+    head.load_state_dict(clean_state_dict(hckpt[key]))
+    head.eval()
+    print(f"Loaded GoalEnergyHead from {args.head_ckpt}")
+
+    ppo = ActorCritic().to(dev)
+    ppo.load_state_dict(load_ppo_checkpoint(args.ppo_ckpt, device=dev), strict=False)
+    ppo.eval()
+    print(f"Loaded ActorCritic from {args.ppo_ckpt}")
+
+    # ── Build scene ───────────────────────────────────────────────────────  #
+    waypoints = make_maze_waypoints()
+    scene, robot, cam_brain, cam_eye, cam_over, dofs, q0 = build_scene(waypoints)
+    print(f"Scene built: {len(waypoints)} hidden beacons, {len(MAZE_WALL_SPECS)} maze walls")
+
+    for _ in range(20): scene.step()
+
+    # ── Harvest breadcrumbs ───────────────────────────────────────────────  #
+    print("\nHarvesting latent breadcrumbs for each beacon ...")
+    bc_dirs: List[np.ndarray]    = []
+    bc_lats: List[torch.Tensor]  = []
+    for i, wp in enumerate(waypoints):
+        print(f"  {wp.name}: {wp.pos}")
+        d, z = harvest_breadcrumb(robot, cam_brain, q0, jepa, ppo, dofs, dev, scene, wp)
+        bc_dirs.append(d)
+        bc_lats.append(z)
+
+    # Restore robot to spawn.
+    robot.set_pos(np.array(ROBOT_SPAWN, np.float32))
+    robot.set_quat(yaw_to_quat(math.pi / 2))
+    robot.set_dofs_position(q0.detach().cpu().numpy(), dofs)
+    for _ in range(20): scene.step()
+    print("  Done.\n")
+
+    # ── Navigation state ─────────────────────────────────────────────────  #
+    prev_action = torch.zeros((1,12), device=dev)
+    prev_cmd:   Optional[torch.Tensor] = None
+
+    sm          = make_sensor_map(args.map_res)
+    trail:      List[np.ndarray] = []
+    recent_pos: Deque[np.ndarray] = deque(maxlen=18)
+    recent_cov: Deque[float]      = deque(maxlen=40)
+
+    found       = [False] * len(waypoints)     # claimed
+    seeking_idx = -1                            # index of beacon being sought (-1 = explore)
+    seek_steps  = 0
+    seek_ema_e  = 4.0
+
+    frontier_xy       = np.array([0.5, 0.5], np.float32)
+    frontier_age      = 0
+    cov_start         = 0.0
+    FRONTIER_PATIENCE = 55
+    frontier_bl:      List[np.ndarray] = []
+    frontier_switches = 0
+    guard_mode        = "none"
+    guard_steps       = 0
+    guard_cmd         = torch.zeros((1,3), device=dev)
+    stuck_count       = 0
+    wander_steps      = 0
+    wander_cmd        = torch.zeros((1,3), device=dev)
+
+    discoveries: List[dict] = []
+    t0 = time.time()
+
+    writer = None
+    if not args.no_video:
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        writer = imageio.get_writer(args.out, fps=30)
+
+    print(f"Running maze exploration ({args.n_steps} steps)")
+    print(f"  Candidates: {args.cands}  |  Horizon: {args.horizon}")
+    print()
+
+    # ── Main loop ────────────────────────────────────────────────────────  #
+    for step in range(args.n_steps):
+
+        # Camera + robot pose.
+        robot_pos_3d, robot_yaw = move_cams(robot, cam_brain, cam_eye, cam_over)
+        robot_xy = robot_pos_3d[:2].astype(np.float32)
+
+        # JEPA encode.
+        vis, prop, _, depth = get_jepa_state(robot, cam_brain, q0, prev_action, dofs, dev)
+        with torch.no_grad():
+            z_current = jepa.encode_online(vis, prop).detach()
+
+        # Update occupancy map.
+        update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth,
+                                     fov_deg=58.0, depth_max=args.depth_max)
+        cov = coverage_percent(sm)
+        trail.append(robot_xy.copy())
+        recent_pos.append(robot_xy.copy())
+        recent_cov.append(cov)
+
+        # ── Waypoint detection ─────────────────────────────────────────── #
+        detected = check_detections(robot_xy, robot_yaw, waypoints, found, seeking_idx)
+        if detected is not None and seeking_idx < 0:
+            seeking_idx = detected
+            seek_steps  = 0
+            seek_ema_e  = 4.0
+            prev_cmd    = None
+            print(f"\n  [SPOTTED] {waypoints[detected].name} at step {step}  "
+                  f"dist={np.linalg.norm(waypoints[detected].pos - robot_xy):.2f}m")
+
+        # ── Goal-direction latent selection for current seek target ─────── #
+        if seeking_idx >= 0:
+            goal_vec_raw  = waypoints[seeking_idx].pos - robot_xy
+            gv_norm = float(np.linalg.norm(goal_vec_raw))
+            goal_vec_unit = goal_vec_raw/gv_norm if gv_norm > 1e-6 else np.array([1.,0.])
+            dirs_k  = bc_dirs[seeking_idx]
+            best_k  = int(np.argmax(dirs_k @ goal_vec_unit))
+            z_goal  = bc_lats[seeking_idx][best_k:best_k+1]  # (1,D)
+            with torch.no_grad():
+                raw_e = float(head(z_current, z_goal).item())
+            seek_ema_e = 0.30*raw_e + 0.70*seek_ema_e
+
+            dist_to_seek = float(gv_norm)
+        else:
+            dist_to_seek = 999.0
+            raw_e = 0.0
+
+        # ── Arrival check ──────────────────────────────────────────────── #
+        if seeking_idx >= 0 and dist_to_seek < ARRIVE_DIST:
+            wp = waypoints[seeking_idx]
+            found[seeking_idx] = True
+            discoveries.append({"name": wp.name, "step": step,
+                                 "dist": round(dist_to_seek, 3),
+                                 "ema_energy": round(seek_ema_e, 3)})
+            n_found = sum(found)
+            print(f"\n  [CLAIMED] {wp.name} at step {step}  "
+                  f"dist={dist_to_seek:.2f}  ({n_found}/{len(waypoints)} found)")
+            seeking_idx = -1; prev_cmd = None
+
+            if all(found):
+                print("\n  All beacons claimed!  Route complete.")
+                if writer:
+                    over_rgb  = render_rgb(cam_over)
+                    eye_rgb   = render_rgb(cam_eye)
+                    frame = compose_frame(
+                        over_rgb, eye_rgb, sm, robot_xy, robot_yaw,
+                        robot_xy, trail, None, waypoints, found, -1,
+                        [f"ALL {len(waypoints)} BEACONS FOUND — step {step}"],
+                    )
+                    writer.append_data(frame)
+                break
+
+        # ── Seek timeout ───────────────────────────────────────────────── #
+        if seeking_idx >= 0:
+            seek_steps += 1
+            if seek_steps > MAX_SEEK_STEPS:
+                print(f"\n  [TIMEOUT] Gave up seeking {waypoints[seeking_idx].name} "
+                      f"at step {step} — resuming exploration")
+                seeking_idx = -1; prev_cmd = None
+
+        # ── Command selection ──────────────────────────────────────────── #
+        if guard_steps > 0:
+            cmd = guard_cmd; guard_steps -= 1
+        elif wander_steps > 0:
+            cmd = wander_cmd; wander_steps -= 1
+        elif seeking_idx >= 0:
+            # Goal-directed.
+            wp      = waypoints[seeking_idx]
+            gvec    = wp.pos - robot_xy
+            gdist   = float(np.linalg.norm(gvec))
+            gdir    = gvec / max(gdist, 1e-8)
+            gbody   = world_to_body_xy(robot_yaw, gdir)
+            gang    = math.atan2(float(gvec[1]), float(gvec[0]))
+            herr    = wrap_to_pi(gang - robot_yaw)
+            cmd, plan_path = plan_seek_cmd(
+                jepa, head, z_current, z_goal,
+                robot_xy, robot_yaw, wp.pos, gbody,
+                gdist, herr, args.cands, args.horizon, dev, prev_cmd,
+            )
+            prev_cmd = cmd.clone()
+        else:
+            # Frontier exploration.
+            frontier_age += 1
+            cov_gain = cov - cov_start
+            force_new = (frontier_age >= FRONTIER_PATIENCE and cov_gain < 0.5)
+            if force_new:
+                frontier_bl.append(frontier_xy.copy())
+                frontier_age = 0; cov_start = cov
+
+            new_f, _ = select_frontier(sm, robot_xy, frontier_bl)
+            if float(np.linalg.norm(new_f - frontier_xy)) > 0.18 or force_new:
+                frontier_switches += 1
+                frontier_xy = new_f; frontier_age = 0; cov_start = cov
+
+            cmd, plan_path = plan_explore_cmd(
+                jepa, z_current, sm, robot_xy, robot_yaw,
+                frontier_xy, prev_cmd, args.cands, args.horizon, dev,
+            )
+            prev_cmd = cmd.clone()
+
+        # ── Stuck detection ────────────────────────────────────────────── #
+        disp = (float(np.linalg.norm(recent_pos[-1]-recent_pos[0]))
+                if len(recent_pos) >= recent_pos.maxlen else 1.0)
+        cov_stall = (len(recent_cov)>=recent_cov.maxlen and
+                     (max(recent_cov)-min(recent_cov)) < 0.3)
+        if guard_steps <= 0 and wander_steps <= 0 and (disp < 0.12 or cov_stall):
+            stuck_count += 1
+            frontier_bl.append(frontier_xy.copy())
+            if stuck_count >= 3:
+                wander_angle = robot_yaw + float(np.random.uniform(-math.pi, math.pi))
+                wander_cmd = torch.tensor([[
+                    0.28*math.cos(wander_angle-robot_yaw),
+                    0.28*math.sin(wander_angle-robot_yaw),
+                    float(np.clip(wrap_to_pi(wander_angle-robot_yaw)*0.5,-0.6,0.6)),
+                ]], device=dev, dtype=torch.float32)
+                wander_steps = 20; stuck_count = 0
+                metric_guard = "wander"
+            else:
+                _, depth_now = render_rgb_depth(cam_brain)
+                if depth_now is not None:
+                    h,w = depth_now.shape[:2]
+                    band = depth_now[int(0.45*h):int(0.90*h),:]
+                    left  = float(np.nanmedian(band[:, :max(1,w//3)]))
+                    right = float(np.nanmedian(band[:, 2*w//3:]))
+                    if left > right+0.10:
+                        guard_cmd = torch.tensor([[-0.18, 0.12,  0.55]],device=dev,dtype=torch.float32)
+                    elif right > left+0.10:
+                        guard_cmd = torch.tensor([[-0.18,-0.12, -0.55]],device=dev,dtype=torch.float32)
+                    else:
+                        guard_cmd = torch.tensor([[-0.22, 0.00,  0.60]],device=dev,dtype=torch.float32)
+                else:
+                    guard_cmd = torch.tensor([[-0.20, 0.10,  0.55]],device=dev,dtype=torch.float32)
+                guard_steps = 12
+        else:
+            if disp >= 0.12: stuck_count = max(0, stuck_count-1)
+
+        # ── Physics step ──────────────────────────────────────────────── #
+        prev_action = ppo_step(scene, robot, q0, prev_action, cmd, dofs, ppo, dev)
+
+        # ── Video frame ───────────────────────────────────────────────── #
+        if writer and step % 2 == 0:
+            over_rgb = render_rgb(cam_over)
+            eye_rgb  = render_rgb(cam_eye)
+            n_found  = sum(found)
+            if seeking_idx >= 0:
+                mode_str = f"SEEK → {waypoints[seeking_idx].name}  E={seek_ema_e:.2f}"
+                tgt_xy   = waypoints[seeking_idx].pos
+            else:
+                mode_str = f"EXPLORE  cov={cov:.1f}%"
+                tgt_xy   = frontier_xy
+            frame = compose_frame(
+                over_rgb, eye_rgb, sm, robot_xy, robot_yaw, tgt_xy,
+                trail, plan_path if 'plan_path' in dir() else None,
+                waypoints, found, seeking_idx,
+                [
+                    f"Step {step}/{args.n_steps} | {n_found}/{len(waypoints)} beacons found",
+                    f"Mode: {mode_str}",
+                    f"Pos: ({robot_xy[0]:.2f},{robot_xy[1]:.2f})  yaw={math.degrees(robot_yaw):+.0f}°",
+                ],
+            )
+            writer.append_data(frame)
+
+        if step % 100 == 0:
+            n_found = sum(found)
+            mode = (f"SEEK {waypoints[seeking_idx].name}"
+                    if seeking_idx >= 0 else "EXPLORE")
+            print(f"  step {step:4d}  cov={cov:.1f}%  {n_found}/{len(waypoints)} found"
+                  f"  mode={mode}  "
+                  + (f"dist={dist_to_seek:.2f}  E={seek_ema_e:.2f}" if seeking_idx>=0 else ""))
+
+    if writer: writer.close()
+
+    elapsed = time.time() - t0
+    n_found = sum(found)
+    print(f"\nMaze Explorer Summary")
+    print(f"  Steps used : {step+1}/{args.n_steps}")
+    print(f"  Elapsed    : {elapsed:.1f}s")
+    print(f"  Coverage   : {coverage_percent(sm):.1f}%")
+    print(f"  Beacons    : {n_found}/{len(waypoints)}")
+    for d in discoveries:
+        print(f"    {d['name']:12s} at step {d['step']:4d}  "
+              f"dist={d['dist']:.2f}  E={d['ema_energy']:.2f}")
+    print(f"\nVideo saved to {args.out}")
+
+
+if __name__ == "__main__":
+    main()
