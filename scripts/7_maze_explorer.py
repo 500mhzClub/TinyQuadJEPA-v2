@@ -687,7 +687,7 @@ def plan_seek_cmd(
             best_path, _, _ = _kin_path(robot_xy, robot_yaw,
                                         cmds[ib].cpu().numpy(), horizon)
 
-    return best_cmd, best_path or np.zeros((horizon,2), np.float32)
+    return best_cmd, best_path if best_path is not None else np.zeros((horizon,2), np.float32)
 
 
 def _kin_path(start_xy, start_yaw, cmd, horizon, dt=0.10):
