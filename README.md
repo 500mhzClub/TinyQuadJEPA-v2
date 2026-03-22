@@ -4,6 +4,30 @@ Canonical JEPA latent world model for quadruped navigation with obstacle awarene
 
 Successor to [TinyQuadJEPA v1](../TinyQuadJEPA/), which demonstrated that VICReg-trained latent dynamics work for open-floor navigation but fail near obstacles the model has never seen. This project fixes both problems: the architecture is now a proper student-teacher JEPA, and the training data includes randomly placed obstacles with diverse textures.
 
+## Demo
+
+### Closed-loop waypoint navigation (energy-guided MPC)
+
+![Navigation demo](jepa_logs/eval_output.gif)
+
+The robot completes a 5-waypoint route (W1 → W2 → W3 → W2 → W1) in **2 298 / 3 000 steps** using a CEM planner that rolls out latent trajectories and scores them with the energy head. No hand-coded path planning — the planner samples velocity commands, simulates them through the predictor, and picks the lowest-energy sequence.
+
+### Energy landscape (epoch 17, horizon 15)
+
+![Energy landscape](jepa_logs/energy_landscape.png)
+
+2D slice through command space `(vx, wz)` with `vy = 0`. The energy head assigns low energy (purple) to commands that steer the predicted latent toward the goal. The optimal command here is `vx = +0.24 m/s, wz = −0.60 rad/s` (energy 4.0083), consistent with the robot needing to turn right to reach the target.
+
+## Results
+
+| Metric | Value |
+|---|---|
+| Route completion | ✅ W1 → W2 → W3 → W2 → W1 |
+| Steps used | 2 298 / 3 000 |
+| Elapsed (CPU) | 194.8 s |
+| Mean arrival dist | ~0.445 m |
+| Exploration coverage (6_explore_demo) | 35.4 % in 1 800 steps |
+
 ## What changed from v1
 
 | | v1 | v2 |
@@ -145,19 +169,32 @@ python scripts/4_train_energy_head.py \
 
 ```bash
 python scripts/5_genesis_eval.py \
-  --jepa_ckpt jepa_checkpoints/jepa_epoch_20.pt \
+  --jepa_ckpt jepa_checkpoints/epoch_17.pt \
   --head_ckpt energy_head_checkpoints/energy_head_best.pt \
-  --ppo_ckpt <ppo_checkpoint> \
+  --ppo_ckpt models/ppo/ckpt_20000.pt \
   --with_obstacles
 ```
 
-### 8. Run the exploration demo
+### 8. Run the open-world exploration demo
 
 ```bash
 python scripts/6_explore_demo.py \
-  --jepa_ckpt jepa_checkpoints/jepa_epoch_20.pt \
-  --ppo_ckpt <ppo_checkpoint>
+  --jepa_ckpt jepa_checkpoints/epoch_17.pt \
+  --ppo_ckpt models/ppo/ckpt_20000.pt
 ```
+
+Frontier-based exploration with EBM guidance. The robot builds an occupancy map from egocentric depth and steers toward unknown territory by scoring candidate commands through the predictor + energy head.
+
+### 9. Run the maze explorer
+
+```bash
+python scripts/7_maze_explorer.py \
+  --jepa_ckpt jepa_checkpoints/epoch_17.pt \
+  --head_ckpt energy_head_checkpoints/energy_head_best.pt \
+  --ppo_ckpt models/ppo/ckpt_20000.pt
+```
+
+A 4-room maze with 5 hidden beacon panels. The robot explores autonomously using frontier selection and, when a beacon enters its field of view, switches to energy-guided goal-seek mode to claim it. Combines the occupancy mapping from script 6 with the goal-directed planner from script 5.
 
 ## Project structure
 
@@ -184,6 +221,7 @@ scripts/
   4_train_energy_head.py       Energy head training
   5_genesis_eval.py            Closed-loop waypoint navigation demo
   6_explore_demo.py            Sensor-frontier exploration demo
+  7_maze_explorer.py           4-room maze with hidden beacon discovery
 
 tools/
   verify_dataset.py            GIF spot-check
@@ -209,6 +247,10 @@ hardware/README.md             Hardware build guide
 **Collision handling strategy:** AABB detection with 0.15m margin resets the robot before the camera clips inside obstacles. Collision frames in the dataset are masked during training so the predictor never learns from physically impossible transitions.
 
 **Texture randomization rationale:** The v1 model overfits to a single checkerboard. A broader texture bank with per-environment variation forces the visual encoder to learn structural features (edges, depth cues) rather than texture-specific patterns.
+
+**CEM planner:** At each step, 512 candidate velocity commands are sampled, rolled out through the GRU predictor for 15 steps, scored by the energy head against the goal latent, and the lowest-cost elite set defines the next distribution. 4–5 CEM iterations per step. Collision penalty and local unknown-area gain are added to the energy cost for exploration.
+
+**Maze explorer beacon latents:** Before the exploration run begins, the robot is teleported to each beacon and the target encoder is run from 4 cardinal approach directions. These multi-view latents serve as the goal representations during seek mode, with the closest-direction latent selected dynamically based on the robot's current heading to the beacon.
 
 ## Collapse monitoring
 
