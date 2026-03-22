@@ -82,7 +82,7 @@ ROBOT_SPAWN = (0.5, -0.5, 0.12)
 DETECT_DIST  = 2.2   # metres
 DETECT_FOV   = 0.90  # radians half-angle (≈ 52°); robot must roughly face the beacon
 ARRIVE_DIST  = 0.45  # metres — waypoint claimed
-MAX_SEEK_STEPS = 500 # give up seeking after this many steps (back to explore)
+MAX_SEEK_STEPS = 200 # give up seeking after this many steps (back to explore)
 
 
 # --------------------------------------------------------------------------- #
@@ -1126,9 +1126,19 @@ def main():
         if seeking_idx >= 0:
             seek_steps += 1
             if seek_steps > MAX_SEEK_STEPS:
-                print(f"\n  [TIMEOUT] Gave up seeking {waypoints[seeking_idx].name} "
+                timed_wp = waypoints[seeking_idx]
+                print(f"\n  [TIMEOUT] Gave up seeking {timed_wp.name} "
                       f"at step {step} — resuming exploration")
                 seek_timeout_cd[seeking_idx] = 350   # don't re-detect for 350 steps
+                # Force retreat: push the frontier target to the opposite side of the
+                # failed waypoint so the robot physically moves away from the wall.
+                away = robot_xy - timed_wp.pos
+                away_norm = float(np.linalg.norm(away))
+                if away_norm > 1e-6:
+                    away = away / away_norm
+                retreat_xy = np.clip(robot_xy + away * 2.0, WORLD_MIN + 0.3, WORLD_MAX - 0.3)
+                frontier_xy = retreat_xy.astype(np.float32)
+                frontier_age = 0; cov_start = cov
                 seeking_idx = -1; prev_cmd = None
 
         # ── Command selection ──────────────────────────────────────────── #
@@ -1208,6 +1218,24 @@ def main():
                 guard_steps = 14; stuck_cooldown = 45
         else:
             if disp >= 0.12: stuck_count = max(0, stuck_count - 1)
+
+        # ── Wall safety filter (last-resort override) ─────────────────── #
+        # If an OCC cell is within 0.38 m ahead AND the command tries to go
+        # forward, override with a turn-away command regardless of the planner.
+        # This prevents the robot from physically clipping into maze walls.
+        if guard_steps <= 0 and wander_steps <= 0:
+            fwd_vec = np.array([math.cos(robot_yaw), math.sin(robot_yaw)], np.float32)
+            wall_ahead = any(sample_cell(sm, robot_xy + d * fwd_vec) == MAP_OCC
+                             for d in (0.18, 0.28, 0.38))
+            if wall_ahead and float(cmd[0, 0].item()) > 0.04:
+                left_pt  = robot_xy + 0.4 * np.array([-math.sin(robot_yaw),  math.cos(robot_yaw)], np.float32)
+                right_pt = robot_xy + 0.4 * np.array([ math.sin(robot_yaw), -math.cos(robot_yaw)], np.float32)
+                left_occ  = sample_cell(sm, left_pt)  == MAP_OCC
+                right_occ = sample_cell(sm, right_pt) == MAP_OCC
+                wz_dir = -1.0 if not right_occ else 1.0
+                cmd = torch.tensor([[-0.12, 0.0, wz_dir * 0.65]],
+                                   device=dev, dtype=torch.float32)
+                plan_path = None
 
         # ── Physics step ──────────────────────────────────────────────── #
         prev_action = ppo_step(scene, robot, q0, prev_action, cmd, dofs, ppo, dev)
