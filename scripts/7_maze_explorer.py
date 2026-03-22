@@ -437,9 +437,9 @@ def update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth_img, fov_deg, de
         for t in np.linspace(0.06, free_until, max(2, int(free_until/max(sm.res*0.7,0.04)))):
             mark_disc(sm, robot_xy + np.array([math.cos(ray_yaw), math.sin(ray_yaw)],
                            np.float32)*float(t), 0.04, MAP_FREE)
-        if dist < depth_max * 0.96:
-            mark_disc(sm, robot_xy + np.array([math.cos(ray_yaw), math.sin(ray_yaw)],
-                           np.float32)*float(dist), 0.08, MAP_OCC)
+        # OCC marking from depth disabled — all real walls are preloaded
+        # via preload_walls_into_sensor_map; CPU depth renderer produces
+        # too many false-positive OCC cells (ground returns, noise).
 
 
 def _frontier_reachable(sm, robot_xy, target_xy, n_samples=10):
@@ -1371,8 +1371,9 @@ def main():
         # This prevents the robot from physically clipping into maze walls.
         if guard_steps <= 0 and wander_steps <= 0:
             fwd_vec = np.array([math.cos(robot_yaw), math.sin(robot_yaw)], np.float32)
-            wall_ahead = any(sample_cell(sm, robot_xy + d * fwd_vec) == MAP_OCC
-                             for d in (0.12, 0.20, 0.30))
+            occ_count = sum(1 for d in (0.12, 0.20, 0.30)
+                           if sample_cell(sm, robot_xy + d * fwd_vec) == MAP_OCC)
+            wall_ahead = occ_count >= 2
             if wall_ahead and float(cmd[0, 0].item()) > 0.02:
                 left_pt  = robot_xy + 0.4 * np.array([-math.sin(robot_yaw),  math.cos(robot_yaw)], np.float32)
                 right_pt = robot_xy + 0.4 * np.array([ math.sin(robot_yaw), -math.cos(robot_yaw)], np.float32)
