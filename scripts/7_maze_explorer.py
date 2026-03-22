@@ -350,6 +350,29 @@ def make_sensor_map(res: float) -> SensorMap:
     return SensorMap(np.full((h,w), MAP_UNKNOWN, np.int8),
                      np.zeros((h,w), np.int32), float(res))
 
+
+def preload_walls_into_sensor_map(sm: SensorMap) -> None:
+    """Mark grid cells that coincide with known maze walls as MAP_OCC.
+
+    Uses the exact wall geometry from MAZE_WALL_SPECS so that
+    _frontier_reachable can filter out frontiers that require crossing a wall
+    even before the depth camera has observed those cells.
+    """
+    for (cx, cy, _), (sx, sy, _), _ in MAZE_WALL_SPECS:
+        x_lo = float(cx) - float(sx) / 2.0
+        x_hi = float(cx) + float(sx) / 2.0
+        y_lo = float(cy) - float(sy) / 2.0
+        y_hi = float(cy) + float(sy) / 2.0
+        # Find all columns whose cell centres fall strictly inside [x_lo, x_hi].
+        c_lo = max(0,      int(math.ceil( (x_lo - float(WORLD_MIN[0]) - sm.res / 2.0) / sm.res)))
+        c_hi = min(sm.w-1, int(math.floor((x_hi - float(WORLD_MIN[0]) - sm.res / 2.0) / sm.res)))
+        r_lo = max(0,      int(math.ceil( (y_lo - float(WORLD_MIN[1]) - sm.res / 2.0) / sm.res)))
+        r_hi = min(sm.h-1, int(math.floor((y_hi - float(WORLD_MIN[1]) - sm.res / 2.0) / sm.res)))
+        for r in range(r_lo, r_hi + 1):
+            for c in range(c_lo, c_hi + 1):
+                sm.grid[r, c] = MAP_OCC
+
+
 def world_to_grid(sm, xy):
     gx = int((float(xy[0])-float(WORLD_MIN[0])) / sm.res)
     gy = int((float(xy[1])-float(WORLD_MIN[1])) / sm.res)
@@ -1027,6 +1050,7 @@ def main():
     prev_cmd:   Optional[torch.Tensor] = None
 
     sm          = make_sensor_map(args.map_res)
+    preload_walls_into_sensor_map(sm)   # seed known wall positions so reachability checks work
     trail:      List[np.ndarray] = []
     recent_pos: Deque[np.ndarray] = deque(maxlen=18)
     recent_cov: Deque[float]      = deque(maxlen=40)
