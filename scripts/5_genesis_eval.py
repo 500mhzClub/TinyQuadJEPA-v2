@@ -467,6 +467,11 @@ def plan_best_cmd(
             z_roll, h_t = jepa.predictor(z_roll, cmds, h_t)
 
         # Energy cost: lower = closer to goal in latent space.
+        # Faded to zero close to the goal: the breadcrumb encodes a specific
+        # approach direction so letting energy dominate at short range causes
+        # the robot to overshoot and reposition to match that approach pose.
+        # Pure geometry is sufficient for final docking.
+        energy_weight = float(np.clip((dist_to_goal - 0.35) / 0.65, 0.0, 1.0))
         eng = head(z_roll, z_goal.expand_as(z_roll))
 
         # Geometric cost: batched kinematic rollout entirely on GPU.
@@ -479,7 +484,7 @@ def plan_best_cmd(
         end_heading_err_t = ((end_goal_angle_t - end_yaw_t + math.pi) % (2.0 * math.pi) - math.pi).abs()
         geo_cost = 0.85 * end_dist_t + 0.10 * end_heading_err_t
 
-        cost = eng + geo_cost
+        cost = energy_weight * eng + geo_cost
         if prev_cmd is not None:
             cost = cost + 0.10 * (cmds - prev_cmd).pow(2).sum(dim=-1)
 
@@ -511,6 +516,56 @@ def plan_best_cmd(
 # --------------------------------------------------------------------------- #
 
 @torch.no_grad()
+def _harvest_single_approach(
+    robot,
+    cam_brain,
+    q0: torch.Tensor,
+    jepa: CanonicalJEPA,
+    ppo: ActorCritic,
+    dofs,
+    dev: torch.device,
+    scene,
+    wp_pos: np.ndarray,
+    approach_dir: np.ndarray,
+    n_avg: int = 5,
+    warmup: int = 10,
+    speed: float = 0.25,
+    start_offset: float = 0.45,
+) -> torch.Tensor:
+    """Encode latents from one approach direction."""
+    start_xy = wp_pos[:2] - start_offset * approach_dir
+    start_yaw = math.atan2(float(approach_dir[1]), float(approach_dir[0]))
+
+    robot.set_pos(np.array([start_xy[0], start_xy[1], 0.12], dtype=np.float32))
+    robot.set_quat(yaw_to_quat(start_yaw))
+    robot.set_dofs_position(q0.detach().cpu().numpy(), dofs)
+    for _ in range(8):
+        scene.step()
+
+    pa = torch.zeros((1, 12), device=dev)
+    cmd = torch.tensor([[speed, 0.0, 0.0]], device=dev)
+
+    for _ in range(warmup):
+        obs = get_sys1_obs(robot, q0, pa, cmd, dofs, dev)
+        pa = ppo.act_deterministic(obs)
+        robot.control_dofs_position(to_genesis_target(q0 + 0.3 * pa[0]), dofs)
+        for _ in range(4):
+            scene.step()
+
+    latents = []
+    for _ in range(n_avg):
+        obs = get_sys1_obs(robot, q0, pa, cmd, dofs, dev)
+        pa = ppo.act_deterministic(obs)
+        robot.control_dofs_position(to_genesis_target(q0 + 0.3 * pa[0]), dofs)
+        for _ in range(4):
+            scene.step()
+        v, p = get_jepa_state(robot, cam_brain, q0, pa, dofs, dev)
+        latents.append(jepa.encode_target(v, p).detach())
+
+    return torch.stack(latents, dim=0).mean(dim=0)
+
+
+@torch.no_grad()
 def harvest_breadcrumb(
     robot,
     cam_brain,
@@ -526,48 +581,34 @@ def harvest_breadcrumb(
     speed: float = 0.25,
     start_offset: float = 0.45,
 ) -> torch.Tensor:
-    """Drive the robot near a beacon and encode the approach with target_encoder.
+    """Encode goal latents by approaching the beacon from 4 cardinal directions.
 
+    Averaging across directions prevents the energy head from locking onto a
+    single approach angle during navigation, which caused overshoot-and-reposition.
     The target encoder is used because the energy head compares predicted latents
     (which live in target space) against goal latents.
     """
-    approach = wp.approach_dir_xy.astype(np.float32)
-    norm = float(np.linalg.norm(approach))
+    primary = wp.approach_dir_xy.astype(np.float32)
+    norm = float(np.linalg.norm(primary))
     if norm > 1e-8:
-        approach = approach / norm
-    start_xy = wp.pos[:2] - start_offset * approach
-    start_yaw = math.atan2(float(approach[1]), float(approach[0]))
+        primary = primary / norm
 
-    robot.set_pos(np.array([start_xy[0], start_xy[1], 0.12], dtype=np.float32))
-    robot.set_quat(yaw_to_quat(start_yaw))
-    robot.set_dofs_position(q0.detach().cpu().numpy(), dofs)
-    for _ in range(8):
-        scene.step()
+    # Four cardinal approach directions.
+    dirs = [
+        primary,
+        np.array([-primary[1],  primary[0]], dtype=np.float32),   # +90 deg
+        np.array([ primary[1], -primary[0]], dtype=np.float32),   # -90 deg
+        -primary,                                                    # opposite
+    ]
 
-    pa = torch.zeros((1, 12), device=dev)
-    cmd = torch.tensor([[speed, 0.0, 0.0]], device=dev)
-
-    # Walk forward for warmup steps to reach approach pose.
-    for _ in range(warmup):
-        obs = get_sys1_obs(robot, q0, pa, cmd, dofs, dev)
-        pa = ppo.act_deterministic(obs)
-        target = to_genesis_target(q0 + 0.3 * pa[0])
-        robot.control_dofs_position(target, dofs)
-        for _ in range(4):
-            scene.step()
-
-    # Collect and average latents at the approach pose.
     latents = []
-    for _ in range(n_avg):
-        obs = get_sys1_obs(robot, q0, pa, cmd, dofs, dev)
-        pa = ppo.act_deterministic(obs)
-        target = to_genesis_target(q0 + 0.3 * pa[0])
-        robot.control_dofs_position(target, dofs)
-        for _ in range(4):
-            scene.step()
-        v, p = get_jepa_state(robot, cam_brain, q0, pa, dofs, dev)
-        # Use target_encoder: goal latents must be in target space.
-        latents.append(jepa.encode_target(v, p).detach())
+    for d in dirs:
+        z = _harvest_single_approach(
+            robot, cam_brain, q0, jepa, ppo, dofs, dev, scene,
+            wp.pos, d, n_avg=n_avg, warmup=warmup,
+            speed=speed, start_offset=start_offset,
+        )
+        latents.append(z)
 
     return torch.stack(latents, dim=0).mean(dim=0)
 
