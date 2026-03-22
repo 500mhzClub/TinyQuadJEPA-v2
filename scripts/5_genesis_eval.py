@@ -466,16 +466,11 @@ def plan_best_cmd(
         for _t in range(horizon):
             z_roll, h_t = jepa.predictor(z_roll, cmds, h_t)
 
-        # Energy cost: min over K approach-direction goal latents.
-        # Using min rather than a single averaged latent means the robot follows
-        # whichever approach direction has lowest cost from its current state.
+        # Energy cost: z_goal is (1, D), selected by the caller as the approach
+        # direction most aligned with the current robot-to-goal vector.
         # Faded to zero close to the goal so pure geometry handles final docking.
         energy_weight = float(np.clip((dist_to_goal - 0.35) / 0.65, 0.0, 1.0))
-        # z_goal: (K, D)  z_roll: (N, D)  → eng: (N,)
-        eng = torch.stack([
-            head(z_roll, z_goal[k:k+1].expand_as(z_roll))
-            for k in range(z_goal.shape[0])
-        ], dim=0).min(dim=0).values
+        eng = head(z_roll, z_goal.expand_as(z_roll))
 
         # Geometric cost: batched kinematic rollout entirely on GPU.
         goal_t = torch.tensor(goal_xy, device=dev, dtype=torch.float32)
@@ -583,14 +578,17 @@ def harvest_breadcrumb(
     warmup: int = 10,
     speed: float = 0.25,
     start_offset: float = 0.45,
-) -> torch.Tensor:
+) -> Tuple[np.ndarray, torch.Tensor]:
     """Encode goal latents by approaching the beacon from 4 cardinal directions.
 
-    Returns a (K=4, D) tensor. The planner scores each candidate command against
-    all K latents and takes the minimum energy, so the robot follows the path of
-    least resistance rather than being locked to one approach direction.
-    The target encoder is used because the energy head compares predicted latents
-    (which live in target space) against goal latents.
+    Returns (dirs, latents) where:
+      dirs    : (K, 2) float32 numpy array of unit approach directions
+      latents : (K, D) tensor, one latent per approach direction
+
+    At runtime, the planner selects the single latent whose approach direction
+    is most aligned with the current robot-to-goal vector. This gives a clean,
+    consistent energy signal that adapts to the robot's position rather than
+    taking a noisy min over all directions.
     """
     primary = wp.approach_dir_xy.astype(np.float32)
     norm = float(np.linalg.norm(primary))
@@ -598,7 +596,7 @@ def harvest_breadcrumb(
         primary = primary / norm
 
     # Four cardinal approach directions.
-    dirs = [
+    dir_list = [
         primary,
         np.array([-primary[1],  primary[0]], dtype=np.float32),   # +90 deg
         np.array([ primary[1], -primary[0]], dtype=np.float32),   # -90 deg
@@ -606,7 +604,7 @@ def harvest_breadcrumb(
     ]
 
     latents = []
-    for d in dirs:
+    for d in dir_list:
         z = _harvest_single_approach(
             robot, cam_brain, q0, jepa, ppo, dofs, dev, scene,
             wp.pos, d, n_avg=n_avg, warmup=warmup,
@@ -614,12 +612,9 @@ def harvest_breadcrumb(
         )
         latents.append(z)
 
-    # Return (K, D) — one latent per approach direction.
-    # squeeze(1): each element is (1, D) from encode_target; stack gives (K, 1, D).
-    # The planner takes min-energy across directions so the robot is guided
-    # toward whichever pose it can reach most naturally, without blending
-    # latents from opposite directions into a meaningless average.
-    return torch.stack(latents, dim=0).squeeze(1)
+    dirs_np = np.stack(dir_list, axis=0)                        # (K, 2)
+    latents_t = torch.stack(latents, dim=0).squeeze(1)          # (K, D)
+    return dirs_np, latents_t
 
 
 # --------------------------------------------------------------------------- #
@@ -1008,15 +1003,17 @@ def main() -> None:
     print()
 
     # ---- Harvest latent breadcrumbs --------------------------------------- #
-    print("\nHarvesting latent breadcrumbs (approach-aligned, averaged) ...")
-    latent_breadcrumbs: List[torch.Tensor] = []
+    print("\nHarvesting latent breadcrumbs (4 approach directions each) ...")
+    breadcrumb_dirs: List[np.ndarray] = []       # (K, 2) per waypoint
+    latent_breadcrumbs: List[torch.Tensor] = []  # (K, D) per waypoint
     for i, wp in enumerate(waypoints):
         print(f"  W{i + 1}: pos={wp.pos[:2]}  approach={wp.approach_dir_xy}")
-        z_goal = harvest_breadcrumb(
+        dirs_np, z_goals = harvest_breadcrumb(
             robot, cam_brain, q0, jepa, ppo, dofs, dev, scene, wp,
             n_avg=5, warmup=10,
         )
-        latent_breadcrumbs.append(z_goal)
+        breadcrumb_dirs.append(dirs_np)
+        latent_breadcrumbs.append(z_goals)
     print("  Done.\n")
 
     # ---- Reset robot to start -------------------------------------------- #
@@ -1068,15 +1065,8 @@ def main() -> None:
         vis, prop = get_jepa_state(robot, cam_brain, q0, prev_action, dofs, dev)
         with torch.no_grad():
             z_current = jepa.encode_online(vis, prop).detach()
-            z_goals = latent_breadcrumbs[target_wp_idx]  # (K, D)
-            raw_energy = float(
-                head(z_current.expand(z_goals.shape[0], -1), z_goals).min().item()
-            )
 
-        ema_energy = ema_alpha * raw_energy + (1.0 - ema_alpha) * ema_energy
-        energy_history.append(ema_energy)
-
-        # Robot world state.
+        # Robot world state (needed for direction selection below).
         rp = to_numpy(robot.get_pos())
         rq = to_numpy(robot.get_quat())
         if rp.ndim > 1:
@@ -1087,6 +1077,24 @@ def main() -> None:
         trail.append(rp[:2].copy())
         yaw = quat_to_yaw(rq)
         dist = float(np.linalg.norm(rp[:2] - goal_xy))
+
+        # Select the approach-direction latent most aligned with the current
+        # robot-to-goal vector.  This gives a clean single-direction energy
+        # signal that adapts to position, avoiding the noisy gradient that
+        # results from taking min over all 4 directions simultaneously.
+        goal_vec_raw = goal_xy - rp[:2]
+        gv_norm = float(np.linalg.norm(goal_vec_raw))
+        goal_vec_unit = goal_vec_raw / gv_norm if gv_norm > 1e-6 else np.array([1.0, 0.0])
+        dirs_k = breadcrumb_dirs[target_wp_idx]            # (K, 2)
+        dots = dirs_k @ goal_vec_unit                      # (K,)
+        best_k = int(np.argmax(dots))
+        z_goal = latent_breadcrumbs[target_wp_idx][best_k:best_k+1]  # (1, D)
+
+        with torch.no_grad():
+            raw_energy = float(head(z_current, z_goal).item())
+
+        ema_energy = ema_alpha * raw_energy + (1.0 - ema_alpha) * ema_energy
+        energy_history.append(ema_energy)
 
         # ---- Check waypoint arrival -------------------------------------- #
         # Hard override: if the robot is very close it has likely clipped the
@@ -1151,7 +1159,7 @@ def main() -> None:
             jepa=jepa,
             head=head,
             z_current=z_current,
-            z_goal=z_goals,
+            z_goal=z_goal,
             robot_xy=rp[:2].copy(),
             robot_yaw=yaw,
             goal_xy=goal_xy.copy(),
