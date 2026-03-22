@@ -450,6 +450,55 @@ def _frontier_reachable(sm, robot_xy, target_xy, n_samples=10):
     return True
 
 
+def bfs_next_waypoint(
+    sm: "SensorMap", robot_xy: np.ndarray, goal_xy: np.ndarray,
+    lookahead_m: float = 0.7,
+) -> Optional[np.ndarray]:
+    """BFS on the occupancy grid; return a world point ~lookahead_m along the path.
+
+    MAP_OCC cells are impassable; FREE and UNKNOWN are traversable.
+    Returns None if no path exists (goal fully walled off).
+    """
+    from collections import deque as _deque
+    start = world_to_grid(sm, robot_xy)
+    end   = world_to_grid(sm, goal_xy)
+    if start is None or end is None:
+        return None
+    if start == end:
+        return grid_to_world(sm, end)
+
+    prev: dict = {start: None}
+    queue = _deque([start])
+
+    while queue:
+        cur = queue.popleft()
+        if cur == end:
+            break
+        r, c = cur
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1),
+                       (-1, -1), (-1, 1), (1, -1), (1, 1)):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < sm.h and 0 <= nc < sm.w:
+                nxt = (nr, nc)
+                if nxt not in prev and sm.grid[nr, nc] != MAP_OCC:
+                    prev[nxt] = cur
+                    queue.append(nxt)
+    else:
+        return None  # queue exhausted without finding end
+
+    # Reconstruct start→end path
+    path: list = []
+    cur: Optional[tuple] = end
+    while cur is not None:
+        path.append(cur)
+        cur = prev.get(cur)
+    path.reverse()
+
+    # Pick the cell closest to lookahead_m from start
+    idx = min(max(1, int(lookahead_m / sm.res)), len(path) - 1)
+    return grid_to_world(sm, path[idx])
+
+
 def select_frontier(sm, robot_xy, blacklist=None, bl_radius=0.40):
     bl = blacklist or []
     cands = []
@@ -1076,7 +1125,8 @@ def main():
     wander_cmd        = torch.zeros((1,3), device=dev)
 
     discoveries: List[dict] = []
-    plan_path: Optional[np.ndarray] = None
+    plan_path:   Optional[np.ndarray] = None
+    nav_target:  np.ndarray = frontier_xy.copy()  # immediate nav target (may differ from frontier when BFS routes around walls)
     t0 = time.time()
 
     writer = None
@@ -1215,9 +1265,17 @@ def main():
                 frontier_switches += 1
                 frontier_xy = new_f; frontier_age = 0; cov_start = cov
 
+            # When the frontier is behind a wall, use BFS to find an
+            # intermediate nav target so the robot routes through gaps.
+            if not _frontier_reachable(sm, robot_xy, frontier_xy):
+                bfs_wp = bfs_next_waypoint(sm, robot_xy, frontier_xy)
+                nav_target = bfs_wp if bfs_wp is not None else frontier_xy
+            else:
+                nav_target = frontier_xy
+
             cmd, plan_path = plan_explore_cmd(
                 jepa, head, z_current, z_explore, sm, robot_xy, robot_yaw,
-                frontier_xy, prev_cmd, args.cands, args.horizon, dev,
+                nav_target, prev_cmd, args.cands, args.horizon, dev,
             )
             prev_cmd = cmd.clone()
 
@@ -1316,7 +1374,9 @@ def main():
                 hdg_to_f = wrap_to_pi(
                     math.atan2(float(frontier_xy[1]-robot_xy[1]),
                                float(frontier_xy[0]-robot_xy[0])) - robot_yaw)
-                mode_dbg = f"EXPLORE  front=({frontier_xy[0]:.2f},{frontier_xy[1]:.2f})  hdg={math.degrees(hdg_to_f):+.0f}°"
+                via_str = (f" via=({nav_target[0]:.2f},{nav_target[1]:.2f})"
+                           if float(np.linalg.norm(nav_target - frontier_xy)) > 0.15 else "")
+                mode_dbg = f"EXPLORE  front=({frontier_xy[0]:.2f},{frontier_xy[1]:.2f}){via_str}  hdg={math.degrees(hdg_to_f):+.0f}°"
             print(f"  step {step:4d}  pos=({robot_xy[0]:.2f},{robot_xy[1]:.2f})"
                   f"  yaw={math.degrees(robot_yaw):+.0f}°"
                   f"  cmd=[{cv[0]:+.2f},{cv[1]:+.2f},{cv[2]:+.2f}]"
