@@ -534,6 +534,22 @@ def select_frontier(sm, robot_xy, blacklist=None, bl_radius=0.40):
     return cands[0][1], cands[0][0]
 
 
+def find_far_unknown(sm, robot_xy, min_dist=0.35):
+    """Fallback target when frontier candidates are not reachable."""
+    best_d = 0.0
+    best_wp = robot_xy.copy()
+    for r in range(sm.h):
+        for c in range(sm.w):
+            if sm.grid[r, c] != MAP_UNKNOWN:
+                continue
+            wp = grid_to_world(sm, (r, c))
+            d = float(np.linalg.norm(wp - robot_xy))
+            if d > best_d:
+                best_d = d
+                best_wp = wp
+    return best_wp if best_d >= min_dist else robot_xy.copy()
+
+
 # --------------------------------------------------------------------------- #
 # Kinematic rollout helpers
 # --------------------------------------------------------------------------- #
@@ -1261,6 +1277,36 @@ def main():
                 frontier_age = 0; cov_start = cov
 
             new_f, _ = select_frontier(sm, robot_xy, frontier_bl)
+            # If the chosen frontier is not reachable by occupancy grid, pick a local reachable frontier or fallback to far unknown.
+            if not _frontier_reachable(sm, robot_xy, new_f):
+                reachable = None
+                best_score = float("-inf")
+                for r in range(1, sm.h-1):
+                    for c in range(1, sm.w-1):
+                        if sm.grid[r,c] != MAP_FREE:
+                            continue
+                        wp = grid_to_world(sm, (r, c))
+                        if any(float(np.linalg.norm(wp - bp)) < 0.40 for bp in frontier_bl):
+                            continue
+                        if float(np.linalg.norm(wp - robot_xy)) < 0.20:
+                            continue
+                        if not _frontier_reachable(sm, robot_xy, wp):
+                            continue
+                        unk = sum(1 for rr in range(r-1,r+2) for cc in range(c-1,c+2)
+                                  if not (rr==r and cc==c) and sm.grid[rr,cc]==MAP_UNKNOWN)
+                        occ = sum(1 for rr in range(r-1,r+2) for cc in range(c-1,c+2)
+                                  if not (rr==r and cc==c) and sm.grid[rr,cc]==MAP_OCC)
+                        dist = float(np.linalg.norm(wp - robot_xy))
+                        score = 0.45*float(unk) - 0.30*dist - 0.35*float(occ) + 2.0
+                        if score > best_score:
+                            best_score = score
+                            reachable = wp
+                if reachable is not None:
+                    new_f = reachable
+                else:
+                    new_f = find_far_unknown(sm, robot_xy)
+                    frontier_bl.clear()
+
             if float(np.linalg.norm(new_f - frontier_xy)) > 0.18 or force_new:
                 frontier_switches += 1
                 frontier_xy = new_f; frontier_age = 0; cov_start = cov
@@ -1297,6 +1343,7 @@ def main():
                     float(np.clip(delta_yaw * 0.55, -0.65, 0.65)),
                 ]], device=dev, dtype=torch.float32)
                 wander_steps = 25; stuck_count = 0; stuck_cooldown = 55
+                frontier_bl.clear()  # avoid being stuck on the same blocked frontier
             else:
                 _, depth_now = render_rgb_depth(cam_brain)
                 if depth_now is not None:
@@ -1318,14 +1365,14 @@ def main():
             if disp >= 0.12: stuck_count = max(0, stuck_count - 1)
 
         # ── Wall safety filter (last-resort override) ─────────────────── #
-        # If an OCC cell is within 0.38 m ahead AND the command tries to go
+        # If an OCC cell is close ahead AND the command tries to go
         # forward, override with a turn-away command regardless of the planner.
         # This prevents the robot from physically clipping into maze walls.
         if guard_steps <= 0 and wander_steps <= 0:
             fwd_vec = np.array([math.cos(robot_yaw), math.sin(robot_yaw)], np.float32)
             wall_ahead = any(sample_cell(sm, robot_xy + d * fwd_vec) == MAP_OCC
-                             for d in (0.18, 0.30, 0.45, 0.60))
-            if wall_ahead and float(cmd[0, 0].item()) > 0.04:
+                             for d in (0.12, 0.18, 0.30, 0.45, 0.60))
+            if wall_ahead and float(cmd[0, 0].item()) > 0.02:
                 left_pt  = robot_xy + 0.4 * np.array([-math.sin(robot_yaw),  math.cos(robot_yaw)], np.float32)
                 right_pt = robot_xy + 0.4 * np.array([ math.sin(robot_yaw), -math.cos(robot_yaw)], np.float32)
                 left_occ  = sample_cell(sm, left_pt)  == MAP_OCC
