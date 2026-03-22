@@ -516,7 +516,8 @@ def select_frontier(sm, robot_xy, blacklist=None, bl_radius=0.40):
             if any(float(np.linalg.norm(wp-bp)) < bl_radius for bp in bl): continue
             # Strongly prefer frontiers the robot can reach without crossing a wall.
             reach = 2.0 if _frontier_reachable(sm, robot_xy, wp) else -1.5
-            cands.append((0.45*float(unk) - 0.30*dist - 0.35*float(occ) + reach, wp))
+            visit_pen = min(int(sm.free_visits[r, c]) * 0.08, 1.2)
+            cands.append((0.45*float(unk) - 0.30*dist - 0.35*float(occ) + reach - visit_pen, wp))
     if not cands:
         if bl:
             return select_frontier(sm, robot_xy)
@@ -1129,7 +1130,7 @@ def main():
     frontier_xy       = np.array([0.5, 0.5], np.float32)
     frontier_age      = 0
     cov_start         = 0.0
-    FRONTIER_PATIENCE = 55
+    FRONTIER_PATIENCE = 120
     frontier_bl:      List[np.ndarray] = []
     frontier_switches = 0
     guard_mode        = "none"
@@ -1305,7 +1306,7 @@ def main():
                     new_f = reachable
                 else:
                     new_f = find_far_unknown(sm, robot_xy)
-                    frontier_bl.clear()
+                    frontier_bl = frontier_bl[-4:]
 
             if float(np.linalg.norm(new_f - frontier_xy)) > 0.18 or force_new:
                 frontier_switches += 1
@@ -1343,7 +1344,7 @@ def main():
                     float(np.clip(delta_yaw * 0.55, -0.65, 0.65)),
                 ]], device=dev, dtype=torch.float32)
                 wander_steps = 25; stuck_count = 0; stuck_cooldown = 55
-                frontier_bl.clear()  # avoid being stuck on the same blocked frontier
+                frontier_bl = frontier_bl[-10:]  # keep recent blacklist so robot doesn't return to same stuck frontiers
             else:
                 _, depth_now = render_rgb_depth(cam_brain)
                 if depth_now is not None:
@@ -1371,7 +1372,7 @@ def main():
         if guard_steps <= 0 and wander_steps <= 0:
             fwd_vec = np.array([math.cos(robot_yaw), math.sin(robot_yaw)], np.float32)
             wall_ahead = any(sample_cell(sm, robot_xy + d * fwd_vec) == MAP_OCC
-                             for d in (0.12, 0.18, 0.30, 0.45, 0.60))
+                             for d in (0.12, 0.20, 0.30))
             if wall_ahead and float(cmd[0, 0].item()) > 0.02:
                 left_pt  = robot_xy + 0.4 * np.array([-math.sin(robot_yaw),  math.cos(robot_yaw)], np.float32)
                 right_pt = robot_xy + 0.4 * np.array([ math.sin(robot_yaw), -math.cos(robot_yaw)], np.float32)
