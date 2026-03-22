@@ -35,7 +35,7 @@ def main():
 
     head = GoalEnergyHead().to(dev)
     head_sd = torch.load(args.head_ckpt, map_location=dev)
-    head.load_state_dict(head_sd.get("head_state_dict", head_sd))
+    head.load_state_dict(head_sd.get("energy_head_state_dict", head_sd.get("head_state_dict", head_sd)))
     head.eval()
 
     # Synthetic start / goal latents.
