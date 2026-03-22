@@ -574,6 +574,44 @@ def harvest_breadcrumb(
     return dirs_np, latents_t
 
 
+@torch.no_grad()
+def harvest_explore_reference(
+    robot, cam_brain, q0, jepa, ppo, dofs, dev, scene,
+    n_avg=8, warmup=15, speed=0.30,
+) -> torch.Tensor:
+    """Encode a 'freely walking forward' reference latent for EBM-guided exploration.
+
+    Returns (1, D) target-encoder latent representing confident forward locomotion
+    in open space.  During exploration the energy head is used to steer the robot
+    toward states that *look like* this — naturally penalising stuck / near-wall
+    situations without needing a separate curiosity head.
+    """
+    robot.set_pos(np.array(ROBOT_SPAWN, np.float32))
+    robot.set_quat(yaw_to_quat(math.pi / 2))
+    robot.set_dofs_position(q0.detach().cpu().numpy(), dofs)
+    for _ in range(8): scene.step()
+
+    pa  = torch.zeros((1, 12), device=dev)
+    cmd = torch.tensor([[speed, 0.0, 0.0]], device=dev)
+    for _ in range(warmup):
+        obs = get_sys1_obs(robot, q0, pa, cmd, dofs, dev)
+        pa  = ppo.act_deterministic(obs)
+        robot.control_dofs_position(to_genesis_target(q0 + 0.3 * pa[0]), dofs)
+        for _ in range(4): scene.step()
+
+    zs = []
+    for _ in range(n_avg):
+        obs = get_sys1_obs(robot, q0, pa, cmd, dofs, dev)
+        pa  = ppo.act_deterministic(obs)
+        robot.control_dofs_position(to_genesis_target(q0 + 0.3 * pa[0]), dofs)
+        for _ in range(4): scene.step()
+        vis, prop, _, _ = get_jepa_state(robot, cam_brain, q0, pa, dofs, dev)
+        zs.append(jepa.encode_target(vis, prop).detach())
+
+    z_ref = torch.stack(zs).mean(0)  # (1, D)
+    return z_ref
+
+
 # --------------------------------------------------------------------------- #
 # Goal-directed planner  (from 5_genesis_eval.py with heading improvements)
 # --------------------------------------------------------------------------- #
@@ -666,9 +704,17 @@ def _kin_path(start_xy, start_yaw, cmd, horizon, dt=0.10):
 # --------------------------------------------------------------------------- #
 
 @torch.no_grad()
-def plan_explore_cmd(jepa, zc, sm, robot_xy, robot_yaw, frontier_xy,
+def plan_explore_cmd(jepa, head, zc, z_explore, sm, robot_xy, robot_yaw, frontier_xy,
                      prev_cmd, cands, hz, dev):
-    """Frontier-directed CEM planner with collision awareness."""
+    """Frontier-directed CEM planner with EBM guidance.
+
+    Uses a pre-harvested 'freely walking forward' reference latent (z_explore) so
+    the energy head rewards states that look like confident open-space locomotion —
+    naturally penalising stuck / near-wall situations.
+
+    Strafing is suppressed: mean vy is always zero and the cost penalises vy commands.
+    The robot always moves forward (vx ≥ 0) while rotating to face the frontier.
+    """
     goal_vec  = frontier_xy - robot_xy
     goal_dist = float(np.linalg.norm(goal_vec))
     if goal_dist < 1e-6:
@@ -676,46 +722,45 @@ def plan_explore_cmd(jepa, zc, sm, robot_xy, robot_yaw, frontier_xy,
         wander = torch.tensor([[0.20, 0.0, 0.55]], device=dev, dtype=torch.float32)
         return wander, np.zeros((hz, 2), np.float32)
 
-    goal_dir  = goal_vec / goal_dist
-    goal_body = world_to_body_xy(robot_yaw, goal_dir)
-    hdg_err   = wrap_to_pi(math.atan2(float(goal_vec[1]), float(goal_vec[0])) - robot_yaw)
-
+    hdg_err = wrap_to_pi(math.atan2(float(goal_vec[1]), float(goal_vec[0])) - robot_yaw)
     far = goal_dist > 0.8
-    ts  = (0.32 if far else 0.22) * float(np.clip(goal_dist/0.9, 0.25, 1.0))
-    if abs(hdg_err) > 0.65: ts *= 0.35
+    ts  = (0.30 if far else 0.20) * float(np.clip(goal_dist / 0.9, 0.25, 1.0))
+    if abs(hdg_err) > 0.65: ts *= 0.40
 
+    # Always move forward + rotate to face goal — never use vy in the mean.
     if abs(hdg_err) > math.pi * 0.55:
-        mean = torch.tensor([0.0, 0.0, math.copysign(0.70, hdg_err)],
+        mean = torch.tensor([0.0, 0.0, math.copysign(0.72, hdg_err)],
                             device=dev, dtype=torch.float32)
-        std  = torch.tensor([0.04, 0.04, 0.15], device=dev, dtype=torch.float32)
+        std  = torch.tensor([0.05, 0.03, 0.14], device=dev, dtype=torch.float32)
     else:
         mean = torch.tensor([
-            clamp(float(goal_body[0])*ts, -0.40, 0.40),
-            clamp(float(goal_body[1])*ts, -0.20, 0.20),
-            clamp(0.55*hdg_err, -0.65, 0.65),
+            clamp(ts, 0.0, 0.40),           # forward only — no backward, no strafe
+            0.0,
+            clamp(0.65 * hdg_err, -0.72, 0.72),
         ], device=dev, dtype=torch.float32)
         std = torch.tensor([
-            0.14 if far else 0.10,
-            0.11 if far else 0.08,
+            0.13 if far else 0.09,
+            0.08 if far else 0.06,          # small std on vy so CEM can use it if truly needed
             0.24 if far else 0.18,
         ], device=dev, dtype=torch.float32)
 
-    z_ref = float(zc.norm(dim=-1).mean().item()) + 1e-6
-    best_cmd  = mean.view(1,3)
+    best_cmd  = mean.view(1, 3)
     best_cost = None
     best_path_np = None
 
     for _ in range(4):
-        cmds = mean + std * torch.randn((cands,3), device=dev)
-        cmds[:,0].clamp_(-0.40, 0.40)
-        cmds[:,1].clamp_(-0.25, 0.25)
-        cmds[:,2].clamp_(-0.60, 0.60)
+        cmds = mean + std * torch.randn((cands, 3), device=dev)
+        cmds[:, 0].clamp_(0.0, 0.40)   # no backward
+        cmds[:, 1].clamp_(-0.20, 0.20)
+        cmds[:, 2].clamp_(-0.70, 0.70)
 
         z_roll = zc.expand(cands, -1)
         h_t    = torch.zeros((cands, jepa.latent_dim), device=dev, dtype=z_roll.dtype)
         for _ in range(hz):
             z_roll, h_t = jepa.predictor(z_roll, cmds, h_t)
-        lat_pen = ((z_roll.norm(dim=-1)/z_ref) - 1.5).clamp(min=0.0)*0.15
+
+        # EBM: steer toward 'freely walking forward' reference.
+        ebm_cost = head(z_roll, z_explore.expand_as(z_roll)) * 0.35
 
         paths_t, end_xy_t = rollout_cmds_batched_paths(robot_xy, robot_yaw, cmds, hz)
         paths_np = paths_t.cpu().numpy()
@@ -725,14 +770,18 @@ def plan_explore_cmd(jepa, zc, sm, robot_xy, robot_yaw, frontier_xy,
         front_np = local_unknown_gain_batched(sm, end_np)
         coll_np  = path_collision_penalty_batched(sm, paths_np)
 
-        smooth = (torch.zeros(cands,device=dev) if prev_cmd is None
-                  else 0.10*(cmds-prev_cmd).pow(2).sum(dim=-1))
-        cost = (torch.from_numpy(coll_np).to(dev) + lat_pen + smooth
-                + (cmds[:,0]<-0.02).float()*0.08
-                - 3.0*torch.from_numpy(prog_np).to(dev)
-                - 0.80*torch.from_numpy(front_np).to(dev))
+        smooth = (torch.zeros(cands, device=dev) if prev_cmd is None
+                  else 0.10 * (cmds - prev_cmd).pow(2).sum(dim=-1))
 
-        k = max(8, cands//10)
+        cost = (torch.from_numpy(coll_np).to(dev)
+                + ebm_cost
+                + smooth
+                + 0.50 * cmds[:, 1].abs()           # penalise strafing
+                + (cmds[:, 0] < 0.02).float() * 0.10  # penalise near-zero vx
+                - 3.0 * torch.from_numpy(prog_np).to(dev)
+                - 0.80 * torch.from_numpy(front_np).to(dev))
+
+        k = max(8, cands // 10)
         elite = torch.topk(cost, k=k, largest=False).indices
         mean  = cmds[elite].mean(0)
         std   = cmds[elite].std(0) + 1e-4
@@ -740,10 +789,10 @@ def plan_explore_cmd(jepa, zc, sm, robot_xy, robot_yaw, frontier_xy,
         ib = int(torch.argmin(cost).item())
         if best_cost is None or float(cost[ib]) < best_cost:
             best_cost    = float(cost[ib])
-            best_cmd     = cmds[ib].detach().clone().view(1,3)
+            best_cmd     = cmds[ib].detach().clone().view(1, 3)
             best_path_np = paths_np[ib]
 
-    return best_cmd, best_path_np if best_path_np is not None else np.zeros((hz,2), np.float32)
+    return best_cmd, best_path_np if best_path_np is not None else np.zeros((hz, 2), np.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -935,6 +984,11 @@ def main():
         bc_dirs.append(d)
         bc_lats.append(z)
 
+    # ── Harvest exploration reference latent ─────────────────────────────  #
+    print("Harvesting exploration reference (forward locomotion) ...")
+    z_explore = harvest_explore_reference(robot, cam_brain, q0, jepa, ppo, dofs, dev, scene)
+    print(f"  z_explore norm={float(z_explore.norm()):.3f}\n")
+
     # Restore robot to spawn.
     robot.set_pos(np.array(ROBOT_SPAWN, np.float32))
     robot.set_quat(yaw_to_quat(math.pi / 2))
@@ -1097,7 +1151,7 @@ def main():
                 frontier_xy = new_f; frontier_age = 0; cov_start = cov
 
             cmd, plan_path = plan_explore_cmd(
-                jepa, z_current, sm, robot_xy, robot_yaw,
+                jepa, head, z_current, z_explore, sm, robot_xy, robot_yaw,
                 frontier_xy, prev_cmd, args.cands, args.horizon, dev,
             )
             prev_cmd = cmd.clone()
