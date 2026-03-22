@@ -1020,6 +1020,7 @@ def main():
     guard_steps       = 0
     guard_cmd         = torch.zeros((1,3), device=dev)
     stuck_count       = 0
+    stuck_cooldown    = 0          # steps before stuck detection can fire again
     wander_steps      = 0
     wander_cmd        = torch.zeros((1,3), device=dev)
 
@@ -1159,38 +1160,40 @@ def main():
         # ── Stuck detection ────────────────────────────────────────────── #
         disp = (float(np.linalg.norm(recent_pos[-1]-recent_pos[0]))
                 if len(recent_pos) >= recent_pos.maxlen else 1.0)
-        cov_stall = (len(recent_cov)>=recent_cov.maxlen and
-                     (max(recent_cov)-min(recent_cov)) < 1.5)
-        if guard_steps <= 0 and wander_steps <= 0 and (disp < 0.12 or cov_stall):
+        if stuck_cooldown > 0:
+            stuck_cooldown -= 1
+        if guard_steps <= 0 and wander_steps <= 0 and stuck_cooldown <= 0 and disp < 0.12:
             stuck_count += 1
             frontier_bl.append(frontier_xy.copy())
             if stuck_count >= 3:
+                # Wander: pick a random heading and drive forward while rotating to it.
                 wander_angle = robot_yaw + float(np.random.uniform(-math.pi, math.pi))
-                wander_cmd = torch.tensor([[
-                    0.28*math.cos(wander_angle-robot_yaw),
-                    0.28*math.sin(wander_angle-robot_yaw),
-                    float(np.clip(wrap_to_pi(wander_angle-robot_yaw)*0.5,-0.6,0.6)),
+                delta_yaw    = wrap_to_pi(wander_angle - robot_yaw)
+                wander_cmd   = torch.tensor([[
+                    0.22,
+                    0.0,
+                    float(np.clip(delta_yaw * 0.55, -0.65, 0.65)),
                 ]], device=dev, dtype=torch.float32)
-                wander_steps = 20; stuck_count = 0
-                metric_guard = "wander"
+                wander_steps = 25; stuck_count = 0; stuck_cooldown = 55
             else:
                 _, depth_now = render_rgb_depth(cam_brain)
                 if depth_now is not None:
-                    h,w = depth_now.shape[:2]
-                    band = depth_now[int(0.45*h):int(0.90*h),:]
-                    left  = float(np.nanmedian(band[:, :max(1,w//3)]))
+                    h, w = depth_now.shape[:2]
+                    band  = depth_now[int(0.45*h):int(0.90*h), :]
+                    left  = float(np.nanmedian(band[:, :max(1, w//3)]))
                     right = float(np.nanmedian(band[:, 2*w//3:]))
-                    if left > right+0.10:
-                        guard_cmd = torch.tensor([[-0.18, 0.12,  0.55]],device=dev,dtype=torch.float32)
-                    elif right > left+0.10:
-                        guard_cmd = torch.tensor([[-0.18,-0.12, -0.55]],device=dev,dtype=torch.float32)
+                    # Back up then rotate toward the more open side.
+                    if left > right + 0.10:
+                        guard_cmd = torch.tensor([[-0.15, 0.0, -0.55]], device=dev, dtype=torch.float32)
+                    elif right > left + 0.10:
+                        guard_cmd = torch.tensor([[-0.15, 0.0,  0.55]], device=dev, dtype=torch.float32)
                     else:
-                        guard_cmd = torch.tensor([[-0.22, 0.00,  0.60]],device=dev,dtype=torch.float32)
+                        guard_cmd = torch.tensor([[-0.15, 0.0,  0.60]], device=dev, dtype=torch.float32)
                 else:
-                    guard_cmd = torch.tensor([[-0.20, 0.10,  0.55]],device=dev,dtype=torch.float32)
-                guard_steps = 12
+                    guard_cmd = torch.tensor([[-0.15, 0.0, 0.55]], device=dev, dtype=torch.float32)
+                guard_steps = 14; stuck_cooldown = 45
         else:
-            if disp >= 0.12: stuck_count = max(0, stuck_count-1)
+            if disp >= 0.12: stuck_count = max(0, stuck_count - 1)
 
         # ── Physics step ──────────────────────────────────────────────── #
         prev_action = ppo_step(scene, robot, q0, prev_action, cmd, dofs, ppo, dev)
@@ -1218,13 +1221,25 @@ def main():
             )
             writer.append_data(frame)
 
-        if step % 100 == 0:
+        if step % 50 == 0:
             n_found = sum(found)
-            mode = (f"SEEK {waypoints[seeking_idx].name}"
-                    if seeking_idx >= 0 else "EXPLORE")
-            print(f"  step {step:4d}  cov={cov:.1f}%  {n_found}/{len(waypoints)} found"
-                  f"  mode={mode}  "
-                  + (f"dist={dist_to_seek:.2f}  E={seek_ema_e:.2f}" if seeking_idx>=0 else ""))
+            cv = cmd[0].cpu().numpy()
+            if guard_steps > 0:
+                mode_dbg = f"GUARD({guard_steps})"
+            elif wander_steps > 0:
+                mode_dbg = f"WANDER({wander_steps})"
+            elif seeking_idx >= 0:
+                mode_dbg = f"SEEK:{waypoints[seeking_idx].name}"
+            else:
+                hdg_to_f = wrap_to_pi(
+                    math.atan2(float(frontier_xy[1]-robot_xy[1]),
+                               float(frontier_xy[0]-robot_xy[0])) - robot_yaw)
+                mode_dbg = f"EXPLORE  front=({frontier_xy[0]:.2f},{frontier_xy[1]:.2f})  hdg={math.degrees(hdg_to_f):+.0f}°"
+            print(f"  step {step:4d}  pos=({robot_xy[0]:.2f},{robot_xy[1]:.2f})"
+                  f"  yaw={math.degrees(robot_yaw):+.0f}°"
+                  f"  cmd=[{cv[0]:+.2f},{cv[1]:+.2f},{cv[2]:+.2f}]"
+                  f"  disp={disp:.2f}  cov={cov:.1f}%  cd={stuck_cooldown}"
+                  f"  {mode_dbg}")
 
     if writer: writer.close()
 
