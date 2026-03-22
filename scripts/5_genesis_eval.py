@@ -615,10 +615,11 @@ def harvest_breadcrumb(
         latents.append(z)
 
     # Return (K, D) — one latent per approach direction.
+    # squeeze(1): each element is (1, D) from encode_target; stack gives (K, 1, D).
     # The planner takes min-energy across directions so the robot is guided
     # toward whichever pose it can reach most naturally, without blending
     # latents from opposite directions into a meaningless average.
-    return torch.stack(latents, dim=0)
+    return torch.stack(latents, dim=0).squeeze(1)
 
 
 # --------------------------------------------------------------------------- #
