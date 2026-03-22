@@ -19,7 +19,6 @@ requirements.local.lock
 models/
 *.mp4
 *.h5
-*.png
 
 # Generated textures
 textures/
