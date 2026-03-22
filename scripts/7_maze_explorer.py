@@ -419,6 +419,14 @@ def update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth_img, fov_deg, de
                            np.float32)*float(dist), 0.08, MAP_OCC)
 
 
+def _frontier_reachable(sm, robot_xy, target_xy, n_samples=10):
+    """True if the straight line robot→target doesn't cross any OCC cell."""
+    for t in np.linspace(0.08, 0.92, n_samples):
+        if sample_cell(sm, robot_xy + t * (target_xy - robot_xy)) == MAP_OCC:
+            return False
+    return True
+
+
 def select_frontier(sm, robot_xy, blacklist=None, bl_radius=0.40):
     bl = blacklist or []
     cands = []
@@ -434,7 +442,9 @@ def select_frontier(sm, robot_xy, blacklist=None, bl_radius=0.40):
             dist = float(np.linalg.norm(wp - robot_xy))
             if dist < 0.20: continue
             if any(float(np.linalg.norm(wp-bp)) < bl_radius for bp in bl): continue
-            cands.append((0.45*float(unk) - 0.30*dist - 0.35*float(occ), wp))
+            # Strongly prefer frontiers the robot can reach without crossing a wall.
+            reach = 2.0 if _frontier_reachable(sm, robot_xy, wp) else -1.5
+            cands.append((0.45*float(unk) - 0.30*dist - 0.35*float(occ) + reach, wp))
     if not cands:
         if bl:
             return select_frontier(sm, robot_xy)
@@ -801,16 +811,22 @@ def plan_explore_cmd(jepa, head, zc, z_explore, sm, robot_xy, robot_yaw, frontie
 # Waypoint detection
 # --------------------------------------------------------------------------- #
 
+def _detection_los(sm, robot_xy, wp_pos, n_samples=12):
+    """True if no OCC cell lies on the first 65 % of the robot→waypoint line.
+
+    Checking only the near portion (5–65 %) catches walls between the robot
+    and the beacon without being blocked by the beacon panel surface itself
+    (which is beyond the arrival position).
+    """
+    for t in np.linspace(0.05, 0.65, n_samples):
+        if sample_cell(sm, robot_xy + t * (wp_pos - robot_xy)) == MAP_OCC:
+            return False
+    return True
+
+
 def check_detections(robot_xy, robot_yaw, waypoints, found, seeking_idx,
                      sm, seek_timeout_cd):
-    """Return index of first undetected/unsought waypoint now in FOV, or None.
-
-    Detection requires:
-      1. Within DETECT_DIST
-      2. Within DETECT_FOV forward half-angle
-      3. Not currently being sought
-      4. Not on cooldown after a timeout
-    """
+    """Return index of first undetected/unsought waypoint now in FOV, or None."""
     for i, wp in enumerate(waypoints):
         if found[i] or i == seeking_idx or seek_timeout_cd[i] > 0:
             continue
@@ -819,7 +835,7 @@ def check_detections(robot_xy, robot_yaw, waypoints, found, seeking_idx,
         if dist > DETECT_DIST:
             continue
         bearing = wrap_to_pi(math.atan2(float(vec[1]), float(vec[0])) - robot_yaw)
-        if abs(bearing) <= DETECT_FOV:
+        if abs(bearing) <= DETECT_FOV and _detection_los(sm, robot_xy, wp.pos):
             return i
     return None
 
@@ -1226,7 +1242,7 @@ def main():
         if guard_steps <= 0 and wander_steps <= 0:
             fwd_vec = np.array([math.cos(robot_yaw), math.sin(robot_yaw)], np.float32)
             wall_ahead = any(sample_cell(sm, robot_xy + d * fwd_vec) == MAP_OCC
-                             for d in (0.18, 0.28, 0.38))
+                             for d in (0.18, 0.30, 0.45, 0.60))
             if wall_ahead and float(cmd[0, 0].item()) > 0.04:
                 left_pt  = robot_xy + 0.4 * np.array([-math.sin(robot_yaw),  math.cos(robot_yaw)], np.float32)
                 right_pt = robot_xy + 0.4 * np.array([ math.sin(robot_yaw), -math.cos(robot_yaw)], np.float32)
