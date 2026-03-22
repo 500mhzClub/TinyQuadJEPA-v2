@@ -421,23 +421,25 @@ def plan_best_cmd(
     speed_scale = float(np.clip(dist_to_goal / 1.2, 0.2, 1.0))
     vx_clamp = float(np.clip(dist_to_goal * 0.55, 0.15, 0.40))
 
-    if abs(heading_error) > math.pi * 0.67:
-        # > 120 deg misaligned: pure in-place rotation, minimal translation noise.
+    if abs(heading_error) > math.pi * 0.55:
+        # > ~99 deg misaligned: pure in-place rotation, minimal translation noise.
+        # Lower threshold (was 120 deg) so the robot pivots before moving rather
+        # than curving on wide arcs.
         mean = torch.tensor([
             0.0,
             0.0,
-            math.copysign(0.70, heading_error),
+            math.copysign(0.75, heading_error),
         ], device=dev, dtype=torch.float32)
         std = torch.tensor([0.04, 0.04, 0.15], device=dev, dtype=torch.float32)
     else:
         transl_scale = (0.30 if far else 0.18) * speed_scale
-        if abs(heading_error) > 0.9:
-            transl_scale *= 0.45
+        if abs(heading_error) > 0.65:
+            transl_scale *= 0.35
 
         mean = torch.tensor([
             clamp(float(goal_body_xy[0]) * transl_scale, -0.35, 0.35),
             clamp(float(goal_body_xy[1]) * transl_scale, -0.20, 0.20),
-            clamp(0.50 * heading_error, -0.55, 0.55),
+            clamp(0.65 * heading_error, -0.72, 0.72),
         ], device=dev, dtype=torch.float32)
 
         std = torch.tensor([
@@ -480,7 +482,7 @@ def plan_best_cmd(
         end_goal_dy = goal_t[1] - end_xy_t[:, 1]
         end_goal_angle_t = torch.atan2(end_goal_dy, end_goal_dx)
         end_heading_err_t = ((end_goal_angle_t - end_yaw_t + math.pi) % (2.0 * math.pi) - math.pi).abs()
-        geo_cost = 0.85 * end_dist_t + 0.10 * end_heading_err_t
+        geo_cost = 0.75 * end_dist_t + 0.30 * end_heading_err_t
 
         cost = energy_weight * eng + geo_cost
         if prev_cmd is not None:
