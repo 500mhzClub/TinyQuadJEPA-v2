@@ -79,8 +79,8 @@ URDF_PATH  = "assets/mini_pupper/mini_pupper.urdf"
 ROBOT_SPAWN = (0.5, -0.5, 0.12)
 
 # Detection thresholds for "seeing" a waypoint.
-DETECT_DIST  = 1.8   # metres
-DETECT_FOV   = 0.70  # radians half-angle (≈ 40°); robot must roughly face the beacon
+DETECT_DIST  = 2.2   # metres
+DETECT_FOV   = 0.90  # radians half-angle (≈ 52°); robot must roughly face the beacon
 ARRIVE_DIST  = 0.45  # metres — waypoint claimed
 MAX_SEEK_STEPS = 500 # give up seeking after this many steps (back to explore)
 
@@ -801,18 +801,16 @@ def plan_explore_cmd(jepa, head, zc, z_explore, sm, robot_xy, robot_yaw, frontie
 # Waypoint detection
 # --------------------------------------------------------------------------- #
 
-def has_line_of_sight(sm, from_xy, to_xy, n_samples=16):
-    """Return True if no OCCUPIED cell blocks the straight line from_xy → to_xy."""
-    for t in np.linspace(0.08, 0.92, n_samples):
-        pt = from_xy + t * (to_xy - from_xy)
-        if sample_cell(sm, pt) == MAP_OCC:
-            return False
-    return True
-
-
 def check_detections(robot_xy, robot_yaw, waypoints, found, seeking_idx,
                      sm, seek_timeout_cd):
-    """Return index of first undetected/unsought waypoint now in FOV, or None."""
+    """Return index of first undetected/unsought waypoint now in FOV, or None.
+
+    Detection requires:
+      1. Within DETECT_DIST
+      2. Within DETECT_FOV forward half-angle
+      3. Not currently being sought
+      4. Not on cooldown after a timeout
+    """
     for i, wp in enumerate(waypoints):
         if found[i] or i == seeking_idx or seek_timeout_cd[i] > 0:
             continue
@@ -821,7 +819,7 @@ def check_detections(robot_xy, robot_yaw, waypoints, found, seeking_idx,
         if dist > DETECT_DIST:
             continue
         bearing = wrap_to_pi(math.atan2(float(vec[1]), float(vec[0])) - robot_yaw)
-        if abs(bearing) <= DETECT_FOV and has_line_of_sight(sm, robot_xy, wp.pos):
+        if abs(bearing) <= DETECT_FOV:
             return i
     return None
 
