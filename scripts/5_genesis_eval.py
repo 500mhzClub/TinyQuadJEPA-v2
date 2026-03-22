@@ -466,13 +466,16 @@ def plan_best_cmd(
         for _t in range(horizon):
             z_roll, h_t = jepa.predictor(z_roll, cmds, h_t)
 
-        # Energy cost: lower = closer to goal in latent space.
-        # Faded to zero close to the goal: the breadcrumb encodes a specific
-        # approach direction so letting energy dominate at short range causes
-        # the robot to overshoot and reposition to match that approach pose.
-        # Pure geometry is sufficient for final docking.
+        # Energy cost: min over K approach-direction goal latents.
+        # Using min rather than a single averaged latent means the robot follows
+        # whichever approach direction has lowest cost from its current state.
+        # Faded to zero close to the goal so pure geometry handles final docking.
         energy_weight = float(np.clip((dist_to_goal - 0.35) / 0.65, 0.0, 1.0))
-        eng = head(z_roll, z_goal.expand_as(z_roll))
+        # z_goal: (K, D)  z_roll: (N, D)  → eng: (N,)
+        eng = torch.stack([
+            head(z_roll, z_goal[k:k+1].expand_as(z_roll))
+            for k in range(z_goal.shape[0])
+        ], dim=0).min(dim=0).values
 
         # Geometric cost: batched kinematic rollout entirely on GPU.
         goal_t = torch.tensor(goal_xy, device=dev, dtype=torch.float32)
@@ -583,8 +586,9 @@ def harvest_breadcrumb(
 ) -> torch.Tensor:
     """Encode goal latents by approaching the beacon from 4 cardinal directions.
 
-    Averaging across directions prevents the energy head from locking onto a
-    single approach angle during navigation, which caused overshoot-and-reposition.
+    Returns a (K=4, D) tensor. The planner scores each candidate command against
+    all K latents and takes the minimum energy, so the robot follows the path of
+    least resistance rather than being locked to one approach direction.
     The target encoder is used because the energy head compares predicted latents
     (which live in target space) against goal latents.
     """
@@ -610,7 +614,11 @@ def harvest_breadcrumb(
         )
         latents.append(z)
 
-    return torch.stack(latents, dim=0).mean(dim=0)
+    # Return (K, D) — one latent per approach direction.
+    # The planner takes min-energy across directions so the robot is guided
+    # toward whichever pose it can reach most naturally, without blending
+    # latents from opposite directions into a meaningless average.
+    return torch.stack(latents, dim=0)
 
 
 # --------------------------------------------------------------------------- #
@@ -1059,8 +1067,9 @@ def main() -> None:
         vis, prop = get_jepa_state(robot, cam_brain, q0, prev_action, dofs, dev)
         with torch.no_grad():
             z_current = jepa.encode_online(vis, prop).detach()
+            z_goals = latent_breadcrumbs[target_wp_idx]  # (K, D)
             raw_energy = float(
-                head(z_current, latent_breadcrumbs[target_wp_idx]).item()
+                head(z_current.expand(z_goals.shape[0], -1), z_goals).min().item()
             )
 
         ema_energy = ema_alpha * raw_energy + (1.0 - ema_alpha) * ema_energy
@@ -1141,7 +1150,7 @@ def main() -> None:
             jepa=jepa,
             head=head,
             z_current=z_current,
-            z_goal=latent_breadcrumbs[target_wp_idx],
+            z_goal=z_goals,
             robot_xy=rp[:2].copy(),
             robot_yaw=yaw,
             goal_xy=goal_xy.copy(),
