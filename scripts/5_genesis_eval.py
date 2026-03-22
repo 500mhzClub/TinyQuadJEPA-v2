@@ -416,6 +416,10 @@ def plan_best_cmd(
         cost = energy(predictor_rollout, z_goal) + geometric_cost + smoothness_penalty
     """
     far = dist_to_goal > 0.9
+    # Continuous speed scaling: ramps from 1.0 (far) down to 0.2 (very close).
+    # Prevents the planner from issuing fast commands that overshoot a nearby waypoint.
+    speed_scale = float(np.clip(dist_to_goal / 1.2, 0.2, 1.0))
+    vx_clamp = float(np.clip(dist_to_goal * 0.55, 0.15, 0.40))
 
     if abs(heading_error) > math.pi * 0.67:
         # > 120 deg misaligned: pure in-place rotation, minimal translation noise.
@@ -426,7 +430,7 @@ def plan_best_cmd(
         ], device=dev, dtype=torch.float32)
         std = torch.tensor([0.04, 0.04, 0.15], device=dev, dtype=torch.float32)
     else:
-        transl_scale = 0.30 if far else 0.18
+        transl_scale = (0.30 if far else 0.18) * speed_scale
         if abs(heading_error) > 0.9:
             transl_scale *= 0.45
 
@@ -437,8 +441,8 @@ def plan_best_cmd(
         ], device=dev, dtype=torch.float32)
 
         std = torch.tensor([
-            0.12 if far else 0.09,
-            0.10 if far else 0.08,
+            (0.12 if far else 0.09) * speed_scale,
+            (0.10 if far else 0.08) * speed_scale,
             0.22 if far else 0.18,
         ], device=dev, dtype=torch.float32)
 
@@ -450,7 +454,7 @@ def plan_best_cmd(
     # CEM iterations.
     for _ in range(5):
         cmds = mean + std * torch.randn((n_candidates, 3), device=dev)
-        cmds[:, 0].clamp_(-0.40, 0.40)
+        cmds[:, 0].clamp_(-vx_clamp, vx_clamp)
         cmds[:, 1].clamp_(-0.25, 0.25)
         cmds[:, 2].clamp_(-0.80, 0.80)
 
