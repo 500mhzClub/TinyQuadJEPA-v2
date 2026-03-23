@@ -97,10 +97,12 @@ BRAIN_CAM_UP_OFFSET  = 0.07
 FRONT_STOP_DIST        = 0.28
 FRONT_BLOCKED_FRAC     = 0.35
 SEEK_STALL_WINDOW      = 14
-SEEK_STALL_DISP        = 0.09
-SEEK_STALL_PROGRESS    = 0.06
+SEEK_STALL_DISP        = 0.05
+SEEK_STALL_PROGRESS    = 0.03
 SEEK_STALL_DEPTH_DELTA = 0.05
 SEEK_RECOVERY_COOLDOWN = 18
+LINE_CHECK_STEP_M      = 0.05
+DETECTION_CLEARANCE_RADIUS = 0.08
 
 
 # --------------------------------------------------------------------------- #
@@ -458,6 +460,16 @@ def depth_view_signature(depth_img, depth_max):
     )
 
 
+def front_blocked_from_depth(depth_img, depth_max) -> bool:
+    stats = depth_guard_stats(depth_img, depth_max)
+    if stats is None:
+        return False
+    return (
+        stats["center_q35"] < FRONT_STOP_DIST
+        or stats["center_close_frac"] > FRONT_BLOCKED_FRAC
+    )
+
+
 def make_escape_cmd_from_depth(depth_img, depth_max, dev,
                                reverse_speed=-0.15, turn_speed=0.55):
     stats = depth_guard_stats(depth_img, depth_max)
@@ -470,6 +482,24 @@ def make_escape_cmd_from_depth(depth_img, depth_max, dev,
     else:
         wz = abs(turn_speed)
     return torch.tensor([[reverse_speed, 0.0, wz]], device=dev, dtype=torch.float32)
+
+
+def reinforce_front_obstacle(sm, robot_xy, robot_yaw, depth_img, depth_max):
+    d = normalize_depth_image(depth_img, depth_max)
+    if d is None:
+        hit_dist = FRONT_STOP_DIST
+    else:
+        h, w = d.shape
+        row_lo = max(0, int(0.12 * h))
+        row_hi = min(h, int(0.62 * h))
+        c0 = max(0, int(0.44 * w))
+        c1 = min(w, max(c0 + 1, int(0.56 * w)))
+        center = d[row_lo:row_hi, c0:c1]
+        hit_dist = float(np.nanpercentile(center, 35)) if center.size else FRONT_STOP_DIST
+        hit_dist = float(clamp(hit_dist, 0.12, depth_max * 0.7))
+    hit_xy = robot_xy + np.array([math.cos(robot_yaw), math.sin(robot_yaw)], np.float32) * hit_dist
+    for _ in range(OCC_VOTE_THRESH + 1):
+        mark_disc(sm, hit_xy, max(OCC_INFLATION_RADIUS, 0.14), MAP_OCC)
 
 
 def update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth_img, fov_deg, depth_max):
@@ -517,7 +547,15 @@ def update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth_img, fov_deg, de
 
 def _frontier_reachable(sm, robot_xy, target_xy, n_samples=10):
     """True if the straight line robot→target doesn't cross any OCC cell."""
-    for t in np.linspace(0.08, 0.92, n_samples):
+    seg = target_xy - robot_xy
+    dist = float(np.linalg.norm(seg))
+    if dist < 1e-6:
+        return True
+    n_samples = max(
+        int(n_samples),
+        int(math.ceil(dist / max(LINE_CHECK_STEP_M, sm.res * 0.5))),
+    )
+    for t in np.linspace(0.05, 0.95, n_samples):
         if sample_occ_with_clearance(sm, robot_xy + t * (target_xy - robot_xy)):
             return False
     return True
@@ -939,10 +977,22 @@ def _detection_los(sm, robot_xy, wp_pos, n_samples=20):
     Checks 5–90 % of the line.  Also rejects detections when the robot itself
     is inside a perceived wall (physics clipping artefact).
     """
-    if sample_occ_with_clearance(sm, robot_xy):
+    if sample_occ_with_clearance(sm, robot_xy, radius=DETECTION_CLEARANCE_RADIUS):
         return False
+    seg = wp_pos - robot_xy
+    dist = float(np.linalg.norm(seg))
+    if dist < 1e-6:
+        return True
+    n_samples = max(
+        int(n_samples),
+        int(math.ceil(dist / max(LINE_CHECK_STEP_M, sm.res * 0.5))),
+    )
     for t in np.linspace(0.05, 0.90, n_samples):
-        if sample_occ_with_clearance(sm, robot_xy + t * (wp_pos - robot_xy)):
+        if sample_occ_with_clearance(
+            sm,
+            robot_xy + t * seg,
+            radius=DETECTION_CLEARANCE_RADIUS,
+        ):
             return False
     return True
 
@@ -1352,11 +1402,14 @@ def main():
             seek_disp = float(np.linalg.norm(seek_recent_pos[-1] - seek_recent_pos[0]))
             seek_progress = float(seek_recent_dist[0] - seek_recent_dist[-1])
             sig_delta = 999.0
+            front_blocked = front_blocked_from_depth(depth, args.depth_max)
             if len(seek_recent_sig) == seek_recent_sig.maxlen:
                 sig_delta = float(np.max(np.abs(seek_recent_sig[-1] - seek_recent_sig[0])))
             if (seek_disp < SEEK_STALL_DISP
                     and seek_progress < SEEK_STALL_PROGRESS
+                    and front_blocked
                     and sig_delta < SEEK_STALL_DEPTH_DELTA):
+                reinforce_front_obstacle(sm, robot_xy, robot_yaw, depth, args.depth_max)
                 guard_cmd = make_escape_cmd_from_depth(
                     depth, args.depth_max, dev,
                     reverse_speed=-0.18, turn_speed=0.60,
@@ -1501,17 +1554,13 @@ def main():
 
         # ── Perception safety filter (seek + explore) ─────────────────── #
         if guard_steps <= 0 and wander_steps <= 0 and clip_retreat_steps <= 0:
-            blocked_stats = depth_guard_stats(depth, args.depth_max)
             fwd_vec = np.array([math.cos(robot_yaw), math.sin(robot_yaw)], np.float32)
             occ_count = sum(1 for d in (0.12, 0.20, 0.30)
                            if sample_occ_with_clearance(sm, robot_xy + d * fwd_vec, radius=0.06))
-            depth_blocked = (
-                blocked_stats is not None and (
-                    blocked_stats["center_q35"] < FRONT_STOP_DIST
-                    or blocked_stats["center_close_frac"] > FRONT_BLOCKED_FRAC
-                )
-            )
+            depth_blocked = front_blocked_from_depth(depth, args.depth_max)
             if float(cmd[0, 0].item()) > 0.02 and (occ_count >= 2 or depth_blocked):
+                if depth_blocked:
+                    reinforce_front_obstacle(sm, robot_xy, robot_yaw, depth, args.depth_max)
                 cmd = make_escape_cmd_from_depth(
                     depth, args.depth_max, dev,
                     reverse_speed=(-0.16 if seeking_idx >= 0 else -0.12),
