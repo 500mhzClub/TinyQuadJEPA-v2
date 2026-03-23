@@ -1,6 +1,7 @@
 """Genesis simulation helpers."""
 from __future__ import annotations
 
+import os
 import numpy as np
 import torch
 
@@ -10,6 +11,7 @@ def resolve_sim_backend(sim_backend_arg: str):
     import genesis as gs  # noqa: delay import
 
     sim_backend_arg = sim_backend_arg.lower().strip()
+    env_backend = os.getenv("GS_BACKEND", "").lower().strip()
     gpu_backend = getattr(gs, "gpu", None)
     explicit_backends = {
         "cpu": ("cpu", "CPU requested"),
@@ -17,9 +19,26 @@ def resolve_sim_backend(sim_backend_arg: str):
         "cuda": ("cuda", "CUDA requested"),
         "vulkan": ("vulkan", "Vulkan requested"),
         "metal": ("metal", "Metal requested"),
+        "amdgpu": ("amdgpu", "AMDGPU requested"),
+        "amd": ("amdgpu", "AMD requested"),
+        "hip": ("amdgpu", "HIP requested"),
     }
 
+    if sim_backend_arg == "auto" and env_backend and env_backend != "auto":
+        sim_backend_arg = env_backend
+
     if sim_backend_arg == "auto":
+        if getattr(torch.version, "hip", None):
+            for attr_name, msg in (
+                ("amdgpu", "AUTO (ROCm/AMDGPU preferred)"),
+                ("vulkan", "AUTO (Vulkan fallback)"),
+                ("gpu", "AUTO (GPU fallback)"),
+                ("cuda", "AUTO (CUDA fallback)"),
+                ("metal", "AUTO (Metal fallback)"),
+            ):
+                backend = getattr(gs, attr_name, None)
+                if backend is not None:
+                    return backend, msg
         if gpu_backend is not None:
             return gpu_backend, "AUTO (GPU preferred)"
         for attr_name, msg in (

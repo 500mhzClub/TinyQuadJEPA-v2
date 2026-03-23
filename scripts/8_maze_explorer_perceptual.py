@@ -1255,8 +1255,10 @@ def main():
     parser.add_argument("--jepa_ckpt", required=True)
     parser.add_argument("--head_ckpt", required=True)
     parser.add_argument("--ppo_ckpt",  required=True)
-    parser.add_argument("--device",      default="cpu")
-    parser.add_argument("--sim_backend", default="auto")
+    parser.add_argument("--device",      type=str, default="auto",
+                        help="Torch device: auto | cuda | cpu.")
+    parser.add_argument("--sim_backend", type=str, default="auto",
+                        help="Genesis backend: auto | amdgpu | vulkan | gpu | cuda | metal | cpu.")
     parser.add_argument("--n_steps",     type=int,   default=4000)
     parser.add_argument("--cands",       type=int,   default=512)
     parser.add_argument("--horizon",     type=int,   default=15)
@@ -1270,11 +1272,27 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    dev = torch.device("cpu" if args.device == "cuda" and
-                       not torch.cuda.is_available() else args.device)
+    if args.device == "auto":
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif args.device == "cuda" and not torch.cuda.is_available():
+        print("CUDA requested but torch.cuda.is_available() is False. Falling back to CPU.")
+        dev = torch.device("cpu")
+    else:
+        dev = torch.device(args.device)
+
+    if dev.type == "cuda":
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+    print(f"Torch device: {dev}")
+    if getattr(torch.version, "hip", None):
+        print(f"PyTorch ROCm/HIP: {torch.version.hip}")
 
     # ── Load models ──────────────────────────────────────────────────────── #
     init_genesis_once(args.sim_backend)
+    print(f"Genesis device: {gs.device}")
 
     jepa = CanonicalJEPA().to(dev)
     sd, _ = load_jepa_checkpoint(args.jepa_ckpt, device=dev)
