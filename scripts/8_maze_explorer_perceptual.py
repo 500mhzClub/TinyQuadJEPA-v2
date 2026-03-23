@@ -86,6 +86,21 @@ MAX_SEEK_STEPS = 400
 # ── Perceptual OCC parameters ──────────────────────────────────────────── #
 OCC_VOTE_THRESH = 4     # hits needed before a cell is promoted to MAP_OCC
 MIN_OCC_DEPTH   = 0.25  # ignore depth endpoints closer than this (body / feet)
+ROBOT_SELF_FREE_RADIUS = 0.08   # don't erase nearby walls with an oversized free bubble
+ROBOT_CLEARANCE_RADIUS = 0.14   # conservative footprint used for LOS / reachability tests
+FREE_RAY_CLEARANCE    = 0.12    # stop free carving before the depth hit
+OCC_INFLATION_RADIUS  = 0.12    # inflate perceived walls from depth only
+
+BRAIN_CAM_FWD_OFFSET = 0.04     # keep the brain camera inside the body collision hull
+BRAIN_CAM_UP_OFFSET  = 0.07
+
+FRONT_STOP_DIST        = 0.28
+FRONT_BLOCKED_FRAC     = 0.35
+SEEK_STALL_WINDOW      = 14
+SEEK_STALL_DISP        = 0.09
+SEEK_STALL_PROGRESS    = 0.06
+SEEK_STALL_DEPTH_DELTA = 0.05
+SEEK_RECOVERY_COOLDOWN = 18
 
 
 # --------------------------------------------------------------------------- #
@@ -215,7 +230,7 @@ def move_cams(robot, cam_brain, cam_eye, cam_over):
     if p.ndim > 1: p = p[0]
     if q.ndim > 1: q = q[0]
     fw, up = forward_up_from_quat(q)
-    brain_pos = p + fw * 0.10 + up * 0.05
+    brain_pos = p + fw * BRAIN_CAM_FWD_OFFSET + up * BRAIN_CAM_UP_OFFSET
     brain_lk  = brain_pos + fw * 1.0
     cam_brain.set_pose(pos=brain_pos, lookat=brain_lk, up=up)
     cam_eye.set_pose(pos=brain_pos, lookat=brain_lk, up=up)
@@ -378,25 +393,90 @@ def sample_cell(sm, xy):
     g = world_to_grid(sm, xy)
     return MAP_OCC if g is None else int(sm.grid[g[0],g[1]])
 
+
+def sample_occ_with_clearance(sm, xy, radius=ROBOT_CLEARANCE_RADIUS) -> bool:
+    g = world_to_grid(sm, xy)
+    if g is None:
+        return True
+    rr = max(0, int(math.ceil(radius / sm.res)))
+    r0, c0 = g
+    for r in range(max(0, r0 - rr), min(sm.h, r0 + rr + 1)):
+        for c in range(max(0, c0 - rr), min(sm.w, c0 + rr + 1)):
+            p = grid_to_world(sm, (r, c))
+            if float(np.linalg.norm(p - xy[:2])) <= radius and sm.grid[r, c] == MAP_OCC:
+                return True
+    return False
+
+
 def coverage_percent(sm):
     return 100.0 * float(np.count_nonzero(sm.grid != MAP_UNKNOWN)) / float(sm.grid.size)
 
 
+def normalize_depth_image(depth_img, depth_max):
+    if depth_img is None:
+        return None
+    d = np.asarray(depth_img, np.float32)
+    if d.ndim == 3:
+        d = d[..., 0]
+    if not np.isfinite(d).any():
+        return None
+    d = np.where(np.isfinite(d), d, np.nan)
+    mx, mn = float(np.nanmax(d)), float(np.nanmin(d))
+    d = np.clip(d, 0, 1) * depth_max if mx <= 1.05 and mn >= 0 else np.clip(d, 0, depth_max)
+    return np.nan_to_num(d, nan=depth_max, posinf=depth_max).astype(np.float32)
+
+
+def depth_guard_stats(depth_img, depth_max):
+    d = normalize_depth_image(depth_img, depth_max)
+    if d is None:
+        return None
+    h, w = d.shape
+    row_lo = max(0, int(0.10 * h))
+    row_hi = min(h, int(0.70 * h))
+    if row_hi <= row_lo:
+        row_lo, row_hi = 0, h
+    c0 = max(0, int(0.30 * w))
+    c1 = min(w, max(c0 + 1, int(0.70 * w)))
+    left   = d[row_lo:row_hi, :max(1, w // 3)]
+    center = d[row_lo:row_hi, c0:c1]
+    right  = d[row_lo:row_hi, max(0, 2 * w // 3):]
+    return {
+        "left_med": float(np.nanmedian(left)),
+        "center_q35": float(np.nanpercentile(center, 35)),
+        "center_close_frac": float(np.mean(center < FRONT_STOP_DIST)),
+        "right_med": float(np.nanmedian(right)),
+    }
+
+
+def depth_view_signature(depth_img, depth_max):
+    stats = depth_guard_stats(depth_img, depth_max)
+    if stats is None:
+        return None
+    return np.array(
+        [stats["left_med"], stats["center_q35"], stats["right_med"]],
+        dtype=np.float32,
+    )
+
+
+def make_escape_cmd_from_depth(depth_img, depth_max, dev,
+                               reverse_speed=-0.15, turn_speed=0.55):
+    stats = depth_guard_stats(depth_img, depth_max)
+    if stats is None:
+        return torch.tensor([[reverse_speed, 0.0, abs(turn_speed)]], device=dev, dtype=torch.float32)
+    if stats["left_med"] > stats["right_med"] + 0.08:
+        wz = -abs(turn_speed)
+    elif stats["right_med"] > stats["left_med"] + 0.08:
+        wz = abs(turn_speed)
+    else:
+        wz = abs(turn_speed)
+    return torch.tensor([[reverse_speed, 0.0, wz]], device=dev, dtype=torch.float32)
+
+
 def update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth_img, fov_deg, depth_max):
     """Update occupancy purely from depth.  OCC uses vote accumulation."""
-    mark_disc(sm, robot_xy, 0.20, MAP_FREE)
+    mark_disc(sm, robot_xy, ROBOT_SELF_FREE_RADIUS, MAP_FREE)
 
-    def norm_d(d):
-        if d is None: return None
-        d = np.asarray(d, np.float32)
-        if d.ndim == 3: d = d[...,0]
-        if not np.isfinite(d).any(): return None
-        d = np.where(np.isfinite(d), d, np.nan)
-        mx, mn = float(np.nanmax(d)), float(np.nanmin(d))
-        d = np.clip(d,0,1)*depth_max if mx<=1.05 and mn>=0 else np.clip(d,0,depth_max)
-        return np.nan_to_num(d, nan=depth_max, posinf=depth_max).astype(np.float32)
-
-    d = norm_d(depth_img)
+    d = normalize_depth_image(depth_img, depth_max)
     if d is None:
         for a in np.linspace(-0.35, 0.35, 11):
             ry = robot_yaw + float(a)
@@ -424,7 +504,7 @@ def update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth_img, fov_deg, de
         ray_dir = np.array([math.cos(ray_yaw), math.sin(ray_yaw)], np.float32)
 
         # Mark free space along ray.
-        free_until = max(0.0, dist-0.08)
+        free_until = max(0.0, dist - FREE_RAY_CLEARANCE)
         for t in np.linspace(0.06, free_until, max(2, int(free_until/max(sm.res*0.7,0.04)))):
             mark_disc(sm, robot_xy + ray_dir * float(t), 0.04, MAP_FREE)
 
@@ -432,13 +512,13 @@ def update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth_img, fov_deg, de
         # Skip readings that are too close (robot body / feet) or at the far
         # clipping plane (unreliable / open sky).
         if MIN_OCC_DEPTH <= dist < depth_max * 0.92:
-            mark_disc(sm, robot_xy + ray_dir * dist, 0.06, MAP_OCC)
+            mark_disc(sm, robot_xy + ray_dir * dist, OCC_INFLATION_RADIUS, MAP_OCC)
 
 
 def _frontier_reachable(sm, robot_xy, target_xy, n_samples=10):
     """True if the straight line robot→target doesn't cross any OCC cell."""
     for t in np.linspace(0.08, 0.92, n_samples):
-        if sample_cell(sm, robot_xy + t * (target_xy - robot_xy)) == MAP_OCC:
+        if sample_occ_with_clearance(sm, robot_xy + t * (target_xy - robot_xy)):
             return False
     return True
 
@@ -859,10 +939,10 @@ def _detection_los(sm, robot_xy, wp_pos, n_samples=20):
     Checks 5–90 % of the line.  Also rejects detections when the robot itself
     is inside a perceived wall (physics clipping artefact).
     """
-    if sample_cell(sm, robot_xy) == MAP_OCC:
+    if sample_occ_with_clearance(sm, robot_xy):
         return False
     for t in np.linspace(0.05, 0.90, n_samples):
-        if sample_cell(sm, robot_xy + t * (wp_pos - robot_xy)) == MAP_OCC:
+        if sample_occ_with_clearance(sm, robot_xy + t * (wp_pos - robot_xy)):
             return False
     return True
 
@@ -1093,6 +1173,11 @@ def main():
     seek_steps       = 0
     seek_ema_e       = 4.0
     seek_timeout_cd  = [0] * len(waypoints)
+    seek_fail_counts = [0] * len(waypoints)
+    seek_recent_pos:  Deque[np.ndarray] = deque(maxlen=SEEK_STALL_WINDOW)
+    seek_recent_dist: Deque[float]      = deque(maxlen=SEEK_STALL_WINDOW)
+    seek_recent_sig:  Deque[np.ndarray] = deque(maxlen=SEEK_STALL_WINDOW)
+    seek_recovery_cd = 0
 
     frontier_xy       = np.array([0.5, 0.5], np.float32)
     frontier_age      = 0
@@ -1144,6 +1229,7 @@ def main():
         # Update occupancy map from depth only.
         update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth,
                                      fov_deg=58.0, depth_max=args.depth_max)
+        depth_sig = depth_view_signature(depth, args.depth_max)
         cov = coverage_percent(sm)
         trail.append(robot_xy.copy())
         recent_pos.append(robot_xy.copy())
@@ -1161,6 +1247,10 @@ def main():
             guard_steps    = 0
             wander_steps   = 0
             stuck_cooldown = 0
+            seek_recent_pos.clear()
+            seek_recent_dist.clear()
+            seek_recent_sig.clear()
+            seek_recovery_cd = 0
             dist_spotted = float(np.linalg.norm(waypoints[detected].pos - robot_xy))
             print(f"\n  [SPOTTED] {waypoints[detected].name} at step {step}  "
                   f"dist={dist_spotted:.2f}m")
@@ -1183,10 +1273,23 @@ def main():
             dist_to_seek = 999.0
             raw_e = 0.0
 
+        if seeking_idx >= 0:
+            seek_recent_pos.append(robot_xy.copy())
+            seek_recent_dist.append(dist_to_seek)
+            if depth_sig is not None:
+                seek_recent_sig.append(depth_sig.copy())
+        else:
+            seek_recent_pos.clear()
+            seek_recent_dist.clear()
+            seek_recent_sig.clear()
+            seek_recovery_cd = 0
+
         # ── Arrival check ──────────────────────────────────────────────── #
         if seeking_idx >= 0 and dist_to_seek < ARRIVE_DIST:
-            wp = waypoints[seeking_idx]
-            found[seeking_idx] = True
+            claimed_idx = seeking_idx
+            wp = waypoints[claimed_idx]
+            found[claimed_idx] = True
+            seek_fail_counts[claimed_idx] = 0
             discoveries.append({"name": wp.name, "step": step,
                                  "dist": round(dist_to_seek, 3),
                                  "ema_energy": round(seek_ema_e, 3)})
@@ -1196,6 +1299,10 @@ def main():
             event_log.append(("CLAIMED",
                                f"step {step:4d}  CLAIMED {wp.name}  ({n_found}/{len(waypoints)})"))
             seeking_idx = -1; prev_cmd = None
+            seek_recent_pos.clear()
+            seek_recent_dist.clear()
+            seek_recent_sig.clear()
+            seek_recovery_cd = 0
 
             if all(found):
                 print("\n  All beacons claimed!  Route complete.")
@@ -1215,10 +1322,13 @@ def main():
         if seeking_idx >= 0:
             seek_steps += 1
             if seek_steps > MAX_SEEK_STEPS:
-                timed_wp = waypoints[seeking_idx]
+                timed_idx = seeking_idx
+                timed_wp = waypoints[timed_idx]
+                seek_fail_counts[timed_idx] += 1
+                cooldown = min(360, 120 + 60 * (seek_fail_counts[timed_idx] - 1))
                 print(f"\n  [TIMEOUT] Gave up seeking {timed_wp.name} "
                       f"at step {step} — resuming exploration")
-                seek_timeout_cd[seeking_idx] = 120
+                seek_timeout_cd[timed_idx] = cooldown
                 away = robot_xy - timed_wp.pos
                 away_norm = float(np.linalg.norm(away))
                 if away_norm > 1e-6:
@@ -1227,6 +1337,44 @@ def main():
                 frontier_xy = retreat_xy.astype(np.float32)
                 frontier_age = 0; cov_start = cov
                 seeking_idx = -1; prev_cmd = None
+                seek_recent_pos.clear()
+                seek_recent_dist.clear()
+                seek_recent_sig.clear()
+                seek_recovery_cd = 0
+
+        # ── Seek stall recovery ────────────────────────────────────────── #
+        if seek_recovery_cd > 0:
+            seek_recovery_cd -= 1
+        if (seeking_idx >= 0 and guard_steps <= 0 and wander_steps <= 0
+                and clip_retreat_steps <= 0 and seek_recovery_cd <= 0
+                and len(seek_recent_pos) == seek_recent_pos.maxlen
+                and len(seek_recent_dist) == seek_recent_dist.maxlen):
+            seek_disp = float(np.linalg.norm(seek_recent_pos[-1] - seek_recent_pos[0]))
+            seek_progress = float(seek_recent_dist[0] - seek_recent_dist[-1])
+            sig_delta = 999.0
+            if len(seek_recent_sig) == seek_recent_sig.maxlen:
+                sig_delta = float(np.max(np.abs(seek_recent_sig[-1] - seek_recent_sig[0])))
+            if (seek_disp < SEEK_STALL_DISP
+                    and seek_progress < SEEK_STALL_PROGRESS
+                    and sig_delta < SEEK_STALL_DEPTH_DELTA):
+                guard_cmd = make_escape_cmd_from_depth(
+                    depth, args.depth_max, dev,
+                    reverse_speed=-0.18, turn_speed=0.60,
+                )
+                guard_steps = 12
+                seek_steps = min(MAX_SEEK_STEPS, seek_steps + 35)
+                seek_recovery_cd = SEEK_RECOVERY_COOLDOWN
+                seek_recent_pos.clear()
+                seek_recent_dist.clear()
+                seek_recent_sig.clear()
+                print(f"\n  [SEEK-STALL] {waypoints[seeking_idx].name} at step {step}  "
+                      f"disp={seek_disp:.2f}m  progress={seek_progress:.2f}m  "
+                      f"view={sig_delta:.3f} — backing off")
+                event_log.append((
+                    "SEEK-STALL",
+                    f"step {step:4d}  SEEK-STALL {waypoints[seeking_idx].name}  "
+                    f"disp={seek_disp:.2f} progress={seek_progress:.2f}",
+                ))
 
         # ── Command selection ──────────────────────────────────────────── #
         if clip_retreat_steps > 0:
@@ -1351,19 +1499,33 @@ def main():
         else:
             if disp >= 0.12: stuck_count = max(0, stuck_count - 1)
 
-        # ── Wall safety filter (explore only — seek uses BFS) ─────────── #
-        if guard_steps <= 0 and wander_steps <= 0 and seeking_idx < 0 and clip_retreat_steps <= 0:
+        # ── Perception safety filter (seek + explore) ─────────────────── #
+        if guard_steps <= 0 and wander_steps <= 0 and clip_retreat_steps <= 0:
+            blocked_stats = depth_guard_stats(depth, args.depth_max)
             fwd_vec = np.array([math.cos(robot_yaw), math.sin(robot_yaw)], np.float32)
             occ_count = sum(1 for d in (0.12, 0.20, 0.30)
-                           if sample_cell(sm, robot_xy + d * fwd_vec) == MAP_OCC)
-            if occ_count >= 2 and float(cmd[0, 0].item()) > 0.02:
-                left_pt  = robot_xy + 0.4 * np.array([-math.sin(robot_yaw),  math.cos(robot_yaw)], np.float32)
-                right_pt = robot_xy + 0.4 * np.array([ math.sin(robot_yaw), -math.cos(robot_yaw)], np.float32)
-                left_occ  = sample_cell(sm, left_pt)  == MAP_OCC
-                right_occ = sample_cell(sm, right_pt) == MAP_OCC
-                wz_dir = -1.0 if not right_occ else 1.0
-                cmd = torch.tensor([[-0.12, 0.0, wz_dir * 0.65]],
-                                   device=dev, dtype=torch.float32)
+                           if sample_occ_with_clearance(sm, robot_xy + d * fwd_vec, radius=0.06))
+            depth_blocked = (
+                blocked_stats is not None and (
+                    blocked_stats["center_q35"] < FRONT_STOP_DIST
+                    or blocked_stats["center_close_frac"] > FRONT_BLOCKED_FRAC
+                )
+            )
+            if float(cmd[0, 0].item()) > 0.02 and (occ_count >= 2 or depth_blocked):
+                cmd = make_escape_cmd_from_depth(
+                    depth, args.depth_max, dev,
+                    reverse_speed=(-0.16 if seeking_idx >= 0 else -0.12),
+                    turn_speed=0.65,
+                )
+                guard_steps = 9 if seeking_idx >= 0 else 5
+                guard_steps -= 1
+                if seeking_idx >= 0:
+                    seek_recent_pos.clear()
+                    seek_recent_dist.clear()
+                    seek_recent_sig.clear()
+                    seek_recovery_cd = max(seek_recovery_cd, 8)
+                    seek_steps = min(MAX_SEEK_STEPS, seek_steps + 12)
+                prev_cmd = cmd.clone()
                 plan_path = None
 
         # ── Physics step ──────────────────────────────────────────────── #

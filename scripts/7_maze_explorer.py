@@ -23,7 +23,8 @@ Usage:
     python scripts/7_maze_explorer.py \\
         --jepa_ckpt jepa_checkpoints/epoch_17.pt \\
         --head_ckpt energy_head_checkpoints/energy_head_best.pt \\
-        --ppo_ckpt  models/ppo/ckpt_20000.pt
+        --ppo_ckpt  models/ppo/ckpt_20000.pt \\
+        --n_steps 12000
 """
 from __future__ import annotations
 
