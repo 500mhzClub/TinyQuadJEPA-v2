@@ -82,7 +82,7 @@ ROBOT_SPAWN = (0.5, -0.5, 0.12)
 DETECT_DIST  = 2.2   # metres
 DETECT_FOV   = 0.90  # radians half-angle (≈ 52°); robot must roughly face the beacon
 ARRIVE_DIST  = 0.45  # metres — waypoint claimed
-MAX_SEEK_STEPS = 200 # give up seeking after this many steps (back to explore)
+MAX_SEEK_STEPS = 400 # give up seeking after this many steps (back to explore)
 
 
 # --------------------------------------------------------------------------- #
@@ -900,14 +900,15 @@ def plan_explore_cmd(jepa, head, zc, z_explore, sm, robot_xy, robot_yaw, frontie
 # Waypoint detection
 # --------------------------------------------------------------------------- #
 
-def _detection_los(sm, robot_xy, wp_pos, n_samples=12):
-    """True if no OCC cell lies on the first 65 % of the robot→waypoint line.
+def _detection_los(sm, robot_xy, wp_pos, n_samples=20):
+    """True if the robot→waypoint line is clear of OCC cells.
 
-    Checking only the near portion (5–65 %) catches walls between the robot
-    and the beacon without being blocked by the beacon panel surface itself
-    (which is beyond the arrival position).
+    Checks 5–90 % of the line.  Also rejects detections when the robot's own
+    position is inside a wall (physics clipping artefact).
     """
-    for t in np.linspace(0.05, 0.65, n_samples):
+    if sample_cell(sm, robot_xy) == MAP_OCC:
+        return False  # robot has clipped into a wall — don't trust detections
+    for t in np.linspace(0.05, 0.90, n_samples):
         if sample_cell(sm, robot_xy + t * (wp_pos - robot_xy)) == MAP_OCC:
             return False
     return True
@@ -1140,6 +1141,7 @@ def main():
     stuck_cooldown    = 0          # steps before stuck detection can fire again
     wander_steps      = 0
     wander_cmd        = torch.zeros((1,3), device=dev)
+    clip_retreat_steps = 0         # steps of forced backward motion after wall-clip
 
     discoveries: List[dict] = []
     plan_path:   Optional[np.ndarray] = None
@@ -1162,6 +1164,10 @@ def main():
         robot_pos_3d, robot_yaw = move_cams(robot, cam_brain, cam_eye, cam_over)
         robot_xy = robot_pos_3d[:2].astype(np.float32)
 
+        # ── Clip detection: physics has pushed robot into a wall ──────── #
+        if sample_cell(sm, robot_xy) == MAP_OCC and clip_retreat_steps <= 0:
+            clip_retreat_steps = 20
+
         # JEPA encode.
         vis, prop, _, depth = get_jepa_state(robot, cam_brain, q0, prev_action, dofs, dev)
         with torch.no_grad():
@@ -1180,10 +1186,14 @@ def main():
         detected = check_detections(robot_xy, robot_yaw, waypoints, found, seeking_idx,
                                     sm, seek_timeout_cd)
         if detected is not None and seeking_idx < 0:
-            seeking_idx = detected
-            seek_steps  = 0
-            seek_ema_e  = 4.0
-            prev_cmd    = None
+            seeking_idx  = detected
+            seek_steps   = 0
+            seek_ema_e   = 4.0
+            prev_cmd     = None
+            # Clear obstacle-recovery state so seeking starts immediately.
+            guard_steps  = 0
+            wander_steps = 0
+            stuck_cooldown = 0
             print(f"\n  [SPOTTED] {waypoints[detected].name} at step {step}  "
                   f"dist={np.linalg.norm(waypoints[detected].pos - robot_xy):.2f}m")
 
@@ -1236,7 +1246,7 @@ def main():
                 timed_wp = waypoints[seeking_idx]
                 print(f"\n  [TIMEOUT] Gave up seeking {timed_wp.name} "
                       f"at step {step} — resuming exploration")
-                seek_timeout_cd[seeking_idx] = 350   # don't re-detect for 350 steps
+                seek_timeout_cd[seeking_idx] = 120   # don't re-detect for 120 steps
                 # Force retreat: push the frontier target to the opposite side of the
                 # failed waypoint so the robot physically moves away from the wall.
                 away = robot_xy - timed_wp.pos
@@ -1249,23 +1259,36 @@ def main():
                 seeking_idx = -1; prev_cmd = None
 
         # ── Command selection ──────────────────────────────────────────── #
-        if guard_steps > 0:
+        if clip_retreat_steps > 0:
+            # Highest priority: back out of a wall the physics clipped us into.
+            cmd = torch.tensor([[-0.25, 0.0, 0.0]], device=dev, dtype=torch.float32)
+            clip_retreat_steps -= 1; plan_path = None
+        elif guard_steps > 0:
             cmd = guard_cmd; guard_steps -= 1; plan_path = None
         elif wander_steps > 0:
             cmd = wander_cmd; wander_steps -= 1; plan_path = None
         elif seeking_idx >= 0:
-            # Goal-directed.
-            wp      = waypoints[seeking_idx]
-            gvec    = wp.pos - robot_xy
-            gdist   = float(np.linalg.norm(gvec))
-            gdir    = gvec / max(gdist, 1e-8)
-            gbody   = world_to_body_xy(robot_yaw, gdir)
-            gang    = math.atan2(float(gvec[1]), float(gvec[0]))
+            # Goal-directed with BFS routing when direct path is wall-blocked.
+            wp    = waypoints[seeking_idx]
+            gvec  = wp.pos - robot_xy
+            gdist = float(np.linalg.norm(gvec))
+
+            if not _frontier_reachable(sm, robot_xy, wp.pos):
+                bfs_tgt  = bfs_next_waypoint(sm, robot_xy, wp.pos, lookahead_m=0.7)
+                seek_nav = bfs_tgt if bfs_tgt is not None else wp.pos
+            else:
+                seek_nav = wp.pos
+
+            navvec  = seek_nav - robot_xy
+            navdist = float(np.linalg.norm(navvec))
+            navdir  = navvec / max(navdist, 1e-8)
+            gbody   = world_to_body_xy(robot_yaw, navdir)
+            gang    = math.atan2(float(navvec[1]), float(navvec[0]))
             herr    = wrap_to_pi(gang - robot_yaw)
             cmd, plan_path = plan_seek_cmd(
                 jepa, head, z_current, z_goal, sm,
-                robot_xy, robot_yaw, wp.pos, gbody,
-                gdist, herr, args.cands, args.horizon, dev, prev_cmd,
+                robot_xy, robot_yaw, seek_nav, gbody,
+                navdist, herr, args.cands, args.horizon, dev, prev_cmd,
             )
             prev_cmd = cmd.clone()
         else:
@@ -1331,7 +1354,7 @@ def main():
                 if len(recent_pos) >= recent_pos.maxlen else 1.0)
         if stuck_cooldown > 0:
             stuck_cooldown -= 1
-        if guard_steps <= 0 and wander_steps <= 0 and stuck_cooldown <= 0 and disp < 0.12:
+        if guard_steps <= 0 and wander_steps <= 0 and stuck_cooldown <= 0 and disp < 0.12 and seeking_idx < 0:
             stuck_count += 1
             frontier_bl.append(frontier_xy.copy())
             if stuck_count >= 3:
@@ -1368,8 +1391,8 @@ def main():
         # ── Wall safety filter (last-resort override) ─────────────────── #
         # If an OCC cell is close ahead AND the command tries to go
         # forward, override with a turn-away command regardless of the planner.
-        # This prevents the robot from physically clipping into maze walls.
-        if guard_steps <= 0 and wander_steps <= 0:
+        # Skipped during seeking — the seek planner + BFS handle wall avoidance.
+        if guard_steps <= 0 and wander_steps <= 0 and seeking_idx < 0 and clip_retreat_steps <= 0:
             fwd_vec = np.array([math.cos(robot_yaw), math.sin(robot_yaw)], np.float32)
             occ_count = sum(1 for d in (0.12, 0.20, 0.30)
                            if sample_cell(sm, robot_xy + d * fwd_vec) == MAP_OCC)
