@@ -533,7 +533,7 @@ def reinforce_front_obstacle(sm, robot_xy, robot_yaw, depth_img, depth_max):
         hit_dist = float(np.nanpercentile(center, 35)) if center.size else FRONT_STOP_DIST
         hit_dist = float(clamp(hit_dist, 0.12, depth_max * 0.7))
     hit_xy = robot_xy + np.array([math.cos(robot_yaw), math.sin(robot_yaw)], np.float32) * hit_dist
-    for _ in range(OCC_VOTE_THRESH + 1):
+    for _ in range(2):
         mark_disc(sm, hit_xy, max(OCC_INFLATION_RADIUS, 0.14), MAP_OCC)
 
 
@@ -1874,8 +1874,8 @@ def main():
                 frontier_switches += 1
                 frontier_xy = new_f; frontier_age = 0; cov_start = cov
 
-            if not _frontier_reachable(sm, robot_xy, frontier_xy):
-                bfs_wp = bfs_next_waypoint(sm, robot_xy, frontier_xy, allow_unknown=False)
+            if not _frontier_reachable(sm, robot_xy, frontier_xy, allow_unknown=True):
+                bfs_wp = bfs_next_waypoint(sm, robot_xy, frontier_xy, allow_unknown=True)
                 nav_target = bfs_wp if bfs_wp is not None else frontier_xy
             else:
                 nav_target = frontier_xy
