@@ -1156,6 +1156,10 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
     grid_t       = torch.as_tensor(sm.grid, device=dev)
     occ_grid     = grid_t == MAP_OCC
     unknown_grid = grid_t == MAP_UNKNOWN
+    # How well the robot is currently facing the frontier (0=sideways, 1=head-on).
+    # Used to scale the turn penalty and forward bonus: when already pointing at
+    # the goal, spinning should be expensive and going straight should pay off.
+    hdg_align = max(0.0, math.cos(hdg_err))
     novelty_steps = {
         max(0, hz // 3 - 1),
         max(0, (2 * hz) // 3 - 1),
@@ -1189,13 +1193,13 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
         cost = (coll_t
                 + smooth
                 + 0.50 * cmds[:, 1].abs()
-                + 0.10 * cmds[:, 2].abs()
+                + (0.10 + 0.28 * hdg_align) * cmds[:, 2].abs()
                 + 0.25 * (-cmds[:, 0]).clamp_min(0.0)
-                + (cmds[:, 0] < 0.02).float() * 0.10
+                + (cmds[:, 0] < 0.02).float() * 0.20
                 - 2.40 * prog_t
                 - 0.90 * front_t
                 - LATENT_NOVELTY_WEIGHT * novelty_t
-                - 0.20 * cmds[:, 0].clamp_min(0.0))
+                - (0.20 + 0.38 * hdg_align) * cmds[:, 0].clamp_min(0.0))
 
         k = max(8, cands // 10)
         elite = torch.topk(cost, k=k, largest=False).indices
