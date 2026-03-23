@@ -85,6 +85,9 @@ MAX_SEEK_STEPS = 220
 DETECT_ENERGY_THRESH  = -1.20
 DETECT_ENERGY_MARGIN  = 0.50
 DETECT_CONFIRM_STEPS  = 8
+GLIMPSE_ENERGY_THRESH = -0.55
+GLIMPSE_ENERGY_MARGIN = 0.15
+GLIMPSE_CONFIRM_STEPS = 4
 
 # ── Perceptual OCC parameters ──────────────────────────────────────────── #
 OCC_VOTE_THRESH = 4     # hits needed before a cell is promoted to MAP_OCC
@@ -619,6 +622,7 @@ def nearest_cell_with_value(sm, goal_xy, value, max_radius_m=0.45):
 def bfs_next_waypoint(
     sm: "SensorMap", robot_xy: np.ndarray, goal_xy: np.ndarray,
     lookahead_m: float = 0.7, allow_unknown: bool = True,
+    snap_goal_to_free: bool = True,
 ) -> Optional[np.ndarray]:
     from collections import deque as _deque
     start = world_to_grid(sm, robot_xy)
@@ -626,6 +630,8 @@ def bfs_next_waypoint(
     if start is None or end is None:
         return None
     if not allow_unknown and sm.grid[end[0], end[1]] != MAP_FREE:
+        if not snap_goal_to_free:
+            return None
         snapped = nearest_cell_with_value(sm, goal_xy, MAP_FREE, max_radius_m=0.45)
         if snapped is None:
             return None
@@ -1171,18 +1177,19 @@ def _detection_los(sm, robot_xy, wp_pos, n_samples=20):
 
 @torch.no_grad()
 def check_detections(z_current, head, bc_lats, found, seeking_idx,
-                     seek_timeout_cd, detect_streaks):
+                     seek_timeout_cd, detect_streaks, glimpse_streaks):
     candidates: List[Tuple[int, float]] = []
     for i, z_goals in enumerate(bc_lats):
         if found[i] or i == seeking_idx or seek_timeout_cd[i] > 0:
             detect_streaks[i] = 0
+            glimpse_streaks[i] = 0
             continue
         zc = z_current.expand(z_goals.shape[0], -1)
         e_min = float(head(zc, z_goals).min().item())
         candidates.append((i, e_min))
 
     if not candidates:
-        return None, None, None
+        return None, None, None, None
 
     candidates.sort(key=lambda x: x[1])
     best_i, best_e = candidates[0]
@@ -1193,11 +1200,19 @@ def check_detections(z_current, head, bc_lats, found, seeking_idx,
             detect_streaks[i] += 1
         else:
             detect_streaks[i] = max(0, detect_streaks[i] - 1)
+        if i == best_i and best_e <= GLIMPSE_ENERGY_THRESH and second_e >= best_e + GLIMPSE_ENERGY_MARGIN:
+            glimpse_streaks[i] += 1
+        else:
+            glimpse_streaks[i] = max(0, glimpse_streaks[i] - 1)
 
     if detect_streaks[best_i] >= DETECT_CONFIRM_STEPS:
         detect_streaks[best_i] = 0
-        return best_i, best_e, second_e
-    return None, best_e, second_e
+        glimpse_streaks[best_i] = 0
+        return best_i, best_e, second_e, "spotted"
+    if glimpse_streaks[best_i] >= GLIMPSE_CONFIRM_STEPS:
+        glimpse_streaks[best_i] = 0
+        return best_i, best_e, second_e, "glimpsed"
+    return None, best_e, second_e, None
 
 
 # --------------------------------------------------------------------------- #
@@ -1431,10 +1446,12 @@ def main():
     seek_timeout_cd  = [0] * len(waypoints)
     seek_fail_counts = [0] * len(waypoints)
     detect_streaks   = [0] * len(waypoints)
+    glimpse_streaks  = [0] * len(waypoints)
     seek_recent_pos:  Deque[np.ndarray] = deque(maxlen=SEEK_STALL_WINDOW)
     seek_recent_dist: Deque[float]      = deque(maxlen=SEEK_STALL_WINDOW)
     seek_recent_sig:  Deque[np.ndarray] = deque(maxlen=SEEK_STALL_WINDOW)
     seek_recovery_cd = 0
+    guard_trip_pos:   Deque[np.ndarray] = deque(maxlen=12)
 
     frontier_xy       = np.array([0.5, 0.5], np.float32)
     frontier_age      = 0
@@ -1494,20 +1511,24 @@ def main():
 
         # ── Waypoint detection ─────────────────────────────────────────── #
         seek_timeout_cd = [max(0, c - 1) for c in seek_timeout_cd]
-        detected, detect_e, detect_second_e = check_detections(
-            z_current, head, bc_lats, found, seeking_idx, seek_timeout_cd, detect_streaks,
+        detected, detect_e, detect_second_e, detect_kind = check_detections(
+            z_current, head, bc_lats, found, seeking_idx, seek_timeout_cd, detect_streaks, glimpse_streaks,
         )
         if detected is not None and seeking_idx < 0:
             detect_wp = waypoints[detected]
             seek_goal_xy = waypoint_seek_anchor(detect_wp)
             proxy_goal_xy = select_goal_proxy(sm, robot_xy, seek_goal_xy, frontier_bl)
             route_ready = (
-                _frontier_reachable(sm, robot_xy, seek_goal_xy, allow_unknown=False)
-                or bfs_next_waypoint(sm, robot_xy, seek_goal_xy,
-                                     lookahead_m=0.7, allow_unknown=False) is not None
+                sample_traversable_with_clearance(sm, seek_goal_xy, allow_unknown=False)
+                and (
+                    _frontier_reachable(sm, robot_xy, seek_goal_xy, allow_unknown=False)
+                    or bfs_next_waypoint(sm, robot_xy, seek_goal_xy,
+                                         lookahead_m=0.7, allow_unknown=False,
+                                         snap_goal_to_free=False) is not None
+                )
             )
             dist_spotted = float(np.linalg.norm(detect_wp.pos - robot_xy))
-            if route_ready:
+            if route_ready and detect_kind == "spotted":
                 seeking_idx    = detected
                 seek_steps     = 0
                 seek_ema_e     = 4.0
@@ -1680,7 +1701,7 @@ def main():
             if not _frontier_reachable(sm, robot_xy, seek_goal_xy, allow_unknown=False):
                 bfs_tgt  = bfs_next_waypoint(
                     sm, robot_xy, seek_goal_xy,
-                    lookahead_m=0.7, allow_unknown=False,
+                    lookahead_m=0.7, allow_unknown=False, snap_goal_to_free=False,
                 )
                 if bfs_tgt is not None:
                     seek_nav = bfs_tgt
@@ -1858,6 +1879,31 @@ def main():
                     seek_recent_sig.clear()
                     seek_recovery_cd = max(seek_recovery_cd, 8)
                     seek_steps = min(MAX_SEEK_STEPS, seek_steps + 12)
+                guard_trip_pos.append(robot_xy.copy())
+                local_guard_hits = sum(
+                    1 for p in guard_trip_pos
+                    if float(np.linalg.norm(p - robot_xy)) < 0.18
+                )
+                if local_guard_hits >= 4:
+                    frontier_bl.append(frontier_xy.copy())
+                    frontier_age = 0
+                    cov_start = cov
+                    wander_cmd = make_escape_cmd_from_depth(
+                        depth, args.depth_max, dev,
+                        reverse_speed=-0.22, turn_speed=0.80,
+                    )
+                    wander_steps = 16
+                    guard_steps = 0
+                    stuck_cooldown = max(stuck_cooldown, 60)
+                    if seeking_idx >= 0:
+                        seek_timeout_cd[seeking_idx] = max(seek_timeout_cd[seeking_idx], 60)
+                        seeking_idx = -1
+                        seek_recent_pos.clear()
+                        seek_recent_dist.clear()
+                        seek_recent_sig.clear()
+                        seek_recovery_cd = 0
+                    prev_cmd = wander_cmd.clone()
+                    cmd = wander_cmd
                 prev_cmd = cmd.clone()
                 plan_path = None
 
