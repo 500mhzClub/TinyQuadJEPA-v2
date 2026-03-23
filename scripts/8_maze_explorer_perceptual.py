@@ -91,11 +91,12 @@ ROBOT_CLEARANCE_RADIUS = 0.14   # conservative footprint used for LOS / reachabi
 FREE_RAY_CLEARANCE    = 0.12    # stop free carving before the depth hit
 OCC_INFLATION_RADIUS  = 0.12    # inflate perceived walls from depth only
 
-BRAIN_CAM_FWD_OFFSET = 0.04     # keep the brain camera inside the body collision hull
-BRAIN_CAM_UP_OFFSET  = 0.07
+BRAIN_CAM_FWD_OFFSET = 0.01     # keep the brain camera well inside the body collision hull
+BRAIN_CAM_UP_OFFSET  = 0.09
 
 FRONT_STOP_DIST        = 0.28
 FRONT_BLOCKED_FRAC     = 0.35
+SEEK_ANCHOR_OFFSET     = 0.35
 SEEK_STALL_WINDOW      = 14
 SEEK_STALL_DISP        = 0.05
 SEEK_STALL_PROGRESS    = 0.03
@@ -110,11 +111,11 @@ DETECTION_CLEARANCE_RADIUS = 0.08
 # --------------------------------------------------------------------------- #
 
 MAZE_WALL_SPECS: List[Tuple] = [
-    ((0.0, -0.3,  0.4), (0.15, 1.8, 0.8), (0.55, 0.55, 0.60)),
-    ((0.0,  2.7,  0.4), (0.15, 2.2, 0.8), (0.55, 0.55, 0.60)),
-    ((2.0, -0.3,  0.4), (0.15, 1.8, 0.8), (0.55, 0.55, 0.60)),
-    ((2.0,  2.7,  0.4), (0.15, 2.2, 0.8), (0.55, 0.55, 0.60)),
-    ((1.4,  2.8,  0.4), (1.2, 0.15, 0.8), (0.55, 0.55, 0.60)),
+    ((0.0, -0.3,  0.4), (0.24, 1.8, 0.8), (0.55, 0.55, 0.60)),
+    ((0.0,  2.7,  0.4), (0.24, 2.2, 0.8), (0.55, 0.55, 0.60)),
+    ((2.0, -0.3,  0.4), (0.24, 1.8, 0.8), (0.55, 0.55, 0.60)),
+    ((2.0,  2.7,  0.4), (0.24, 2.2, 0.8), (0.55, 0.55, 0.60)),
+    ((1.4,  2.8,  0.4), (1.2, 0.24, 0.8), (0.55, 0.55, 0.60)),
 ]
 
 
@@ -561,15 +562,44 @@ def _frontier_reachable(sm, robot_xy, target_xy, n_samples=10):
     return True
 
 
+def waypoint_seek_anchor(wp: MazeWaypoint) -> np.ndarray:
+    return (wp.pos - SEEK_ANCHOR_OFFSET * wp.approach_dir).astype(np.float32)
+
+
+def nearest_cell_with_value(sm, goal_xy, value, max_radius_m=0.45):
+    goal_rc = world_to_grid(sm, goal_xy)
+    if goal_rc is None:
+        return None
+    rr_max = max(1, int(math.ceil(max_radius_m / sm.res)))
+    best_rc = None
+    best_dist = float("inf")
+    r0, c0 = goal_rc
+    for r in range(max(0, r0 - rr_max), min(sm.h, r0 + rr_max + 1)):
+        for c in range(max(0, c0 - rr_max), min(sm.w, c0 + rr_max + 1)):
+            if sm.grid[r, c] != value:
+                continue
+            p = grid_to_world(sm, (r, c))
+            d = float(np.linalg.norm(p - goal_xy))
+            if d <= max_radius_m and d < best_dist:
+                best_dist = d
+                best_rc = (r, c)
+    return best_rc
+
+
 def bfs_next_waypoint(
     sm: "SensorMap", robot_xy: np.ndarray, goal_xy: np.ndarray,
-    lookahead_m: float = 0.7,
+    lookahead_m: float = 0.7, allow_unknown: bool = True,
 ) -> Optional[np.ndarray]:
     from collections import deque as _deque
     start = world_to_grid(sm, robot_xy)
     end   = world_to_grid(sm, goal_xy)
     if start is None or end is None:
         return None
+    if not allow_unknown and sm.grid[end[0], end[1]] != MAP_FREE:
+        snapped = nearest_cell_with_value(sm, goal_xy, MAP_FREE, max_radius_m=0.45)
+        if snapped is None:
+            return None
+        end = snapped
     if start == end:
         return grid_to_world(sm, end)
 
@@ -586,9 +616,15 @@ def bfs_next_waypoint(
             nr, nc = r + dr, c + dc
             if 0 <= nr < sm.h and 0 <= nc < sm.w:
                 nxt = (nr, nc)
-                if nxt not in prev and sm.grid[nr, nc] != MAP_OCC:
-                    prev[nxt] = cur
-                    queue.append(nxt)
+                if nxt in prev:
+                    continue
+                cell = sm.grid[nr, nc]
+                if cell == MAP_OCC:
+                    continue
+                if not allow_unknown and cell != MAP_FREE:
+                    continue
+                prev[nxt] = cur
+                queue.append(nxt)
     else:
         return None
 
