@@ -991,34 +991,59 @@ def draw_minimap(draw, sm, robot_xy, robot_yaw, target_xy, trail, plan_path,
 
 def compose_frame(over_rgb, eye_rgb, sm, robot_xy, robot_yaw, target_xy,
                   trail, plan_path, waypoints, found, seeking_idx,
-                  status_lines):
-    canvas = Image.new("RGB", (896, 560), (20,20,20))
-    canvas.paste(Image.fromarray(over_rgb[:,:,:3].astype(np.uint8)), (0, 48))
-    canvas.paste(Image.fromarray(eye_rgb[:,:,:3].astype(np.uint8)).resize((384,384)), (512, 96))
+                  status_lines, event_log=None):
+    # Layout (896 x 660):
+    #   Header  y=  0..55   — title + beacon completion pills
+    #   Views   y= 56..567  — overhead (0..511) | eye (512..895, 56..439)
+    #   R-panel y=440..659  — status text + minimap  (right of eye view)
+    #   L-strip y=568..659  — event log              (below overhead)
+    canvas = Image.new("RGB", (896, 660), (20, 20, 20))
+    draw   = ImageDraw.Draw(canvas)
 
-    draw = ImageDraw.Draw(canvas)
-    draw.rectangle([0,0,895,47], fill=(12,12,12), outline=(70,70,70))
-    draw.text((14,14), "JEPA v2 Maze Explorer — discover hidden beacons",
-              fill=(0,220,140))
+    # ── Header ─────────────────────────────────────────────────── #
+    draw.rectangle([0, 0, 895, 55], fill=(12, 12, 12), outline=(55, 55, 55))
+    draw.text((12, 19), "JEPA v2  Maze Explorer", fill=(0, 220, 140))
 
-    draw.text((14,50), "World + follow view", fill=(190,190,190))
-    draw.text((526,78), "Robot eye view",     fill=(190,190,190))
-
-    for i, line in enumerate(status_lines):
-        draw.text((14, 510+14*i), line, fill=(200,200,200))
-
-    draw_minimap(draw, sm, robot_xy, robot_yaw, target_xy, trail, plan_path,
-                 waypoints, found, seeking_idx)
-    draw.text((512, 356), "Sensor map  (grey=free  red=occ  coloured=beacons)",
-              fill=(190,190,190))
-
-    # Legend for waypoints on right side.
+    # Beacon completion pills
+    pill_x0, pill_w, pill_gap = 280, 94, 5
     for i, wp in enumerate(waypoints):
-        c = tuple(int(x*255) for x in wp.color_rgb)
-        lx, ly = 512, 480 + i*14
-        draw.rectangle([lx,ly,lx+10,ly+10], fill=c, outline=(180,180,180))
-        status = "FOUND" if found[i] else ("SEEKING" if i==seeking_idx else "hidden")
-        draw.text((lx+14, ly), f"{wp.name}: {status}", fill=(180,180,180))
+        bx     = pill_x0 + i * (pill_w + pill_gap)
+        c_full = tuple(int(x * 255) for x in wp.color_rgb)
+        label  = wp.name.split("-")[1]
+        if found[i]:
+            draw.rectangle([bx, 10, bx+pill_w, 45], fill=c_full, outline=(255,255,255), width=2)
+            draw.text((bx+6, 21), f"[OK] {label}", fill=(0, 0, 0))
+        elif i == seeking_idx:
+            draw.rectangle([bx, 10, bx+pill_w, 45], fill=(30, 30, 30), outline=c_full, width=2)
+            draw.text((bx+6, 21), f"[>>] {label}", fill=c_full)
+        else:
+            draw.rectangle([bx, 10, bx+pill_w, 45], fill=(25, 25, 25), outline=(55, 55, 55), width=1)
+            draw.text((bx+6, 21), label, fill=(65, 65, 65))
+
+    n_found = sum(found)
+    draw.text((pill_x0 + 5*(pill_w+pill_gap) + 8, 21),
+              f"{n_found}/{len(waypoints)}", fill=(160, 160, 160))
+
+    # ── Overhead view (left) — clean ───────────────────────────── #
+    canvas.paste(Image.fromarray(over_rgb[:,:,:3].astype(np.uint8)), (0, 56))
+
+    # ── Eye view (right top) — clean ───────────────────────────── #
+    canvas.paste(Image.fromarray(eye_rgb[:,:,:3].astype(np.uint8)).resize((384, 384)), (512, 56))
+
+    # ── Right HUD panel (below eye view) ───────────────────────── #
+    draw.rectangle([512, 440, 895, 659], fill=(14, 14, 14), outline=(55, 55, 55))
+    for i, line in enumerate(status_lines):
+        draw.text((520, 447 + i * 16), line, fill=(200, 200, 200))
+    draw_minimap(draw, sm, robot_xy, robot_yaw, target_xy, trail, plan_path,
+                 waypoints, found, seeking_idx,
+                 mx=514, my=494, mw=372, mh=155)
+
+    # ── Event log (below overhead view) ────────────────────────── #
+    draw.rectangle([0, 568, 511, 659], fill=(14, 14, 14), outline=(55, 55, 55))
+    draw.text((8, 572), "events", fill=(70, 70, 70))
+    for i, (ev_type, ev_text) in enumerate((event_log or [])[-4:]):
+        col = (255, 210, 60) if ev_type == "SPOTTED" else (80, 255, 120)
+        draw.text((8, 587 + i * 18), ev_text, fill=col)
 
     return np.asarray(canvas)
 
@@ -1145,6 +1170,7 @@ def main():
     clip_retreat_steps = 0         # steps of forced backward motion after wall-clip
 
     discoveries: List[dict] = []
+    event_log:   List[Tuple[str, str]] = []   # (type, text) for HUD display
     plan_path:   Optional[np.ndarray] = None
     nav_target:  np.ndarray = frontier_xy.copy()  # immediate nav target (may differ from frontier when BFS routes around walls)
     t0 = time.time()
@@ -1195,8 +1221,11 @@ def main():
             guard_steps  = 0
             wander_steps = 0
             stuck_cooldown = 0
+            dist_spotted = float(np.linalg.norm(waypoints[detected].pos - robot_xy))
             print(f"\n  [SPOTTED] {waypoints[detected].name} at step {step}  "
-                  f"dist={np.linalg.norm(waypoints[detected].pos - robot_xy):.2f}m")
+                  f"dist={dist_spotted:.2f}m")
+            event_log.append(("SPOTTED",
+                               f"step {step:4d}  SPOTTED {waypoints[detected].name}  {dist_spotted:.1f}m"))
 
         # ── Goal-direction latent selection for current seek target ─────── #
         if seeking_idx >= 0:
@@ -1225,6 +1254,8 @@ def main():
             n_found = sum(found)
             print(f"\n  [CLAIMED] {wp.name} at step {step}  "
                   f"dist={dist_to_seek:.2f}  ({n_found}/{len(waypoints)} found)")
+            event_log.append(("CLAIMED",
+                               f"step {step:4d}  CLAIMED {wp.name}  ({n_found}/{len(waypoints)})"))
             seeking_idx = -1; prev_cmd = None
 
             if all(found):
@@ -1236,6 +1267,7 @@ def main():
                         over_rgb, eye_rgb, sm, robot_xy, robot_yaw,
                         robot_xy, trail, None, waypoints, found, -1,
                         [f"ALL {len(waypoints)} BEACONS FOUND — step {step}"],
+                        event_log=event_log,
                     )
                     writer.append_data(frame)
                 break
@@ -1427,10 +1459,11 @@ def main():
                 trail, plan_path,
                 waypoints, found, seeking_idx,
                 [
-                    f"Step {step}/{args.n_steps} | {n_found}/{len(waypoints)} beacons found",
-                    f"Mode: {mode_str}",
-                    f"Pos: ({robot_xy[0]:.2f},{robot_xy[1]:.2f})  yaw={math.degrees(robot_yaw):+.0f}°",
+                    f"step {step}/{args.n_steps}   cov={cov:.1f}%",
+                    f"mode: {mode_str}",
+                    f"pos ({robot_xy[0]:.2f},{robot_xy[1]:.2f})  yaw={math.degrees(robot_yaw):+.0f}deg",
                 ],
+                event_log=event_log,
             )
             writer.append_data(frame)
 
