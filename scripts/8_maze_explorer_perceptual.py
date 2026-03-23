@@ -460,7 +460,12 @@ def normalize_depth_image(depth_img, depth_max):
     d = np.where(np.isfinite(d), d, np.nan)
     mx, mn = float(np.nanmax(d)), float(np.nanmin(d))
     d = np.clip(d, 0, 1) * depth_max if mx <= 1.05 and mn >= 0 else np.clip(d, 0, depth_max)
-    return np.nan_to_num(d, nan=depth_max, posinf=depth_max).astype(np.float32)
+    d = np.nan_to_num(d, nan=depth_max, posinf=depth_max).astype(np.float32)
+    # Genesis/Vulkan reverse-Z: 0.0 = no geometry (sky / beyond range).
+    # Also catches body/feet returns inside MIN_OCC_DEPTH.
+    # Treat all sub-threshold readings as "no valid hit" = depth_max.
+    d[d < MIN_OCC_DEPTH] = depth_max
+    return d
 
 
 def depth_guard_stats(depth_img, depth_max):
