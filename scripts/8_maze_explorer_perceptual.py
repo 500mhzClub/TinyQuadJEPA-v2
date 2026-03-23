@@ -88,6 +88,10 @@ DETECT_CONFIRM_STEPS  = 8
 GLIMPSE_ENERGY_THRESH = -0.55
 GLIMPSE_ENERGY_MARGIN = 0.15
 GLIMPSE_CONFIRM_STEPS = 4
+DETECT_STRIDE         = 4
+GLIMPSE_COOLDOWN      = 45
+PROXY_ROUTE_RADIUS    = 0.45
+BREADCRUMB_YAW_OFFSETS_DEG = (-28.0, -12.0, 0.0, 12.0, 28.0)
 
 # ── Perceptual OCC parameters ──────────────────────────────────────────── #
 OCC_VOTE_THRESH = 4     # hits needed before a cell is promoted to MAP_OCC
@@ -897,12 +901,11 @@ def harvest_breadcrumb(
     n_avg=5, warmup=10, speed=0.25, start_offset=0.45,
 ) -> Tuple[np.ndarray, torch.Tensor]:
     primary = wp.approach_dir / max(float(np.linalg.norm(wp.approach_dir)), 1e-8)
-    dir_list = [
-        primary,
-        np.array([-primary[1],  primary[0]], np.float32),
-        np.array([ primary[1], -primary[0]], np.float32),
-        -primary,
-    ]
+    base_yaw = math.atan2(float(primary[1]), float(primary[0]))
+    dir_list = []
+    for yaw_deg in BREADCRUMB_YAW_OFFSETS_DEG:
+        yaw = base_yaw + math.radians(float(yaw_deg))
+        dir_list.append(np.array([math.cos(yaw), math.sin(yaw)], np.float32))
 
     latents = []
     for d in dir_list:
@@ -1177,10 +1180,10 @@ def _detection_los(sm, robot_xy, wp_pos, n_samples=20):
 
 @torch.no_grad()
 def check_detections(z_current, head, bc_lats, found, seeking_idx,
-                     seek_timeout_cd, detect_streaks, glimpse_streaks):
+                     seek_timeout_cd, glimpse_timeout_cd, detect_streaks, glimpse_streaks):
     candidates: List[Tuple[int, float]] = []
     for i, z_goals in enumerate(bc_lats):
-        if found[i] or i == seeking_idx or seek_timeout_cd[i] > 0:
+        if found[i] or i == seeking_idx or seek_timeout_cd[i] > 0 or glimpse_timeout_cd[i] > 0:
             detect_streaks[i] = 0
             glimpse_streaks[i] = 0
             continue
@@ -1444,6 +1447,7 @@ def main():
     seek_steps       = 0
     seek_ema_e       = 4.0
     seek_timeout_cd  = [0] * len(waypoints)
+    glimpse_timeout_cd = [0] * len(waypoints)
     seek_fail_counts = [0] * len(waypoints)
     detect_streaks   = [0] * len(waypoints)
     glimpse_streaks  = [0] * len(waypoints)
@@ -1511,21 +1515,36 @@ def main():
 
         # ── Waypoint detection ─────────────────────────────────────────── #
         seek_timeout_cd = [max(0, c - 1) for c in seek_timeout_cd]
-        detected, detect_e, detect_second_e, detect_kind = check_detections(
-            z_current, head, bc_lats, found, seeking_idx, seek_timeout_cd, detect_streaks, glimpse_streaks,
-        )
+        glimpse_timeout_cd = [max(0, c - 1) for c in glimpse_timeout_cd]
+        detected = None
+        detect_e = None
+        detect_second_e = None
+        detect_kind = None
+        if (seeking_idx < 0 and guard_steps <= 0 and wander_steps <= 0 and clip_retreat_steps <= 0
+                and step % DETECT_STRIDE == 0):
+            detected, detect_e, detect_second_e, detect_kind = check_detections(
+                z_current, head, bc_lats, found, seeking_idx,
+                seek_timeout_cd, glimpse_timeout_cd, detect_streaks, glimpse_streaks,
+            )
         if detected is not None and seeking_idx < 0:
             detect_wp = waypoints[detected]
             seek_goal_xy = waypoint_seek_anchor(detect_wp)
             proxy_goal_xy = select_goal_proxy(sm, robot_xy, seek_goal_xy, frontier_bl)
+            proxy_ready = (
+                proxy_goal_xy is not None
+                and float(np.linalg.norm(proxy_goal_xy - seek_goal_xy)) <= PROXY_ROUTE_RADIUS
+            )
             route_ready = (
-                sample_traversable_with_clearance(sm, seek_goal_xy, allow_unknown=False)
-                and (
-                    _frontier_reachable(sm, robot_xy, seek_goal_xy, allow_unknown=False)
-                    or bfs_next_waypoint(sm, robot_xy, seek_goal_xy,
-                                         lookahead_m=0.7, allow_unknown=False,
-                                         snap_goal_to_free=False) is not None
+                (
+                    sample_traversable_with_clearance(sm, seek_goal_xy, allow_unknown=False)
+                    and (
+                        _frontier_reachable(sm, robot_xy, seek_goal_xy, allow_unknown=False)
+                        or bfs_next_waypoint(sm, robot_xy, seek_goal_xy,
+                                             lookahead_m=0.7, allow_unknown=False,
+                                             snap_goal_to_free=False) is not None
+                    )
                 )
+                or proxy_ready
             )
             dist_spotted = float(np.linalg.norm(detect_wp.pos - robot_xy))
             if route_ready and detect_kind == "spotted":
@@ -1551,6 +1570,7 @@ def main():
                     frontier_xy = proxy_goal_xy.astype(np.float32)
                     frontier_age = 0
                     cov_start = cov
+                glimpse_timeout_cd[detected] = max(glimpse_timeout_cd[detected], GLIMPSE_COOLDOWN)
                 seek_timeout_cd[detected] = max(seek_timeout_cd[detected], 30)
                 print(f"\n  [GLIMPSED] {detect_wp.name} at step {step}  "
                       f"dist={dist_spotted:.2f}m  E={detect_e:.2f}  — no free route yet")
