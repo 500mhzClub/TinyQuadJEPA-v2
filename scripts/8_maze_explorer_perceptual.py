@@ -730,10 +730,20 @@ def path_collision_penalty_batched(sm, paths_np):
     pts = paths_np.reshape(-1, 2)
     gx = np.clip(((pts[:,0]-float(WORLD_MIN[0]))/sm.res).astype(np.int32), 0, sm.w-1)
     gy = np.clip(((pts[:,1]-float(WORLD_MIN[1]))/sm.res).astype(np.int32), 0, sm.h-1)
-    pen = (sm.grid[gy,gx]==MAP_OCC).astype(np.float32)*1.8
-    for dr,dc in ((-1,0),(1,0),(0,-1),(0,1)):
+    occ0 = (sm.grid[gy, gx] == MAP_OCC).astype(np.float32)
+    pen = occ0 * 2.8
+    orth_hits = np.zeros_like(occ0)
+    for dr,dc,w in (
+        (-1,0,0.28), (1,0,0.28), (0,-1,0.28), (0,1,0.28),
+        (-1,-1,0.20), (-1,1,0.20), (1,-1,0.20), (1,1,0.20),
+        (-2,0,0.10), (2,0,0.10), (0,-2,0.10), (0,2,0.10),
+    ):
         gyn = np.clip(gy+dr,0,sm.h-1); gxn = np.clip(gx+dc,0,sm.w-1)
-        pen += (sm.grid[gyn,gxn]==MAP_OCC).astype(np.float32)*0.015
+        hit = (sm.grid[gyn,gxn] == MAP_OCC).astype(np.float32)
+        pen += hit * w
+        if abs(dr) + abs(dc) == 1:
+            orth_hits += hit
+    pen += (orth_hits >= 2).astype(np.float32) * 0.75
     return pen.reshape(N,hz).sum(axis=1)
 
 
@@ -894,7 +904,13 @@ def plan_seek_cmd(
         end_herr_t = ((end_ang_t - end_yaw_t + math.pi) % (2*math.pi) - math.pi).abs()
         geo_cost   = 0.75*end_dist_t + 0.30*end_herr_t
 
-        cost = energy_weight*eng + geo_cost + torch.from_numpy(coll_np).to(dev)
+        cost = (
+            energy_weight * eng
+            + geo_cost
+            + torch.from_numpy(coll_np).to(dev)
+            + 0.45 * cmds[:, 1].abs()
+            + 0.06 * cmds[:, 2].abs()
+        )
         if prev_cmd is not None:
             cost = cost + 0.10*(cmds - prev_cmd).pow(2).sum(dim=-1)
 
@@ -1588,7 +1604,7 @@ def main():
                 frontier_xy = new_f; frontier_age = 0; cov_start = cov
 
             if not _frontier_reachable(sm, robot_xy, frontier_xy):
-                bfs_wp = bfs_next_waypoint(sm, robot_xy, frontier_xy)
+                bfs_wp = bfs_next_waypoint(sm, robot_xy, frontier_xy, allow_unknown=False)
                 nav_target = bfs_wp if bfs_wp is not None else frontier_xy
             else:
                 nav_target = frontier_xy
@@ -1638,9 +1654,26 @@ def main():
         # ── Perception safety filter (seek + explore) ─────────────────── #
         if guard_steps <= 0 and wander_steps <= 0 and clip_retreat_steps <= 0:
             fwd_vec = np.array([math.cos(robot_yaw), math.sin(robot_yaw)], np.float32)
+            left_vec = np.array([-math.sin(robot_yaw),  math.cos(robot_yaw)], np.float32)
             occ_count = sum(1 for d in (0.12, 0.20, 0.30)
                            if sample_occ_with_clearance(sm, robot_xy + d * fwd_vec, radius=0.06))
             depth_blocked = front_blocked_from_depth(depth, args.depth_max)
+            left_occ = sample_occ_with_clearance(sm, robot_xy + 0.14 * left_vec, radius=0.08)
+            right_occ = sample_occ_with_clearance(sm, robot_xy - 0.14 * left_vec, radius=0.08)
+
+            # Zero lateral "wall scraping" commands and turn away from the close wall.
+            if abs(float(cmd[0, 1].item())) > 0.05 and (left_occ or right_occ):
+                turn = (0.45 if left_occ and not right_occ
+                        else -0.45 if right_occ and not left_occ
+                        else float(cmd[0, 2].item()))
+                cmd = torch.tensor([[
+                    min(float(cmd[0, 0].item()), 0.18),
+                    0.0,
+                    turn,
+                ]], device=dev, dtype=torch.float32)
+                prev_cmd = cmd.clone()
+                plan_path = None
+
             if float(cmd[0, 0].item()) > 0.02 and (occ_count >= 2 or depth_blocked):
                 if depth_blocked:
                     reinforce_front_obstacle(sm, robot_xy, robot_yaw, depth, args.depth_max)
