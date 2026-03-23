@@ -82,6 +82,9 @@ DETECT_DIST  = 2.2   # metres
 DETECT_FOV   = 0.90  # radians half-angle (~52°)
 ARRIVE_DIST  = 0.45  # metres — waypoint claimed
 MAX_SEEK_STEPS = 400
+DETECT_ENERGY_THRESH  = 0.95
+DETECT_ENERGY_MARGIN  = 0.18
+DETECT_CONFIRM_STEPS  = 4
 
 # ── Perceptual OCC parameters ──────────────────────────────────────────── #
 OCC_VOTE_THRESH = 4     # hits needed before a cell is promoted to MAP_OCC
@@ -1033,19 +1036,35 @@ def _detection_los(sm, robot_xy, wp_pos, n_samples=20):
     return True
 
 
-def check_detections(robot_xy, robot_yaw, waypoints, found, seeking_idx,
-                     sm, seek_timeout_cd):
-    for i, wp in enumerate(waypoints):
+@torch.no_grad()
+def check_detections(z_current, head, bc_lats, found, seeking_idx,
+                     seek_timeout_cd, detect_streaks):
+    candidates: List[Tuple[int, float]] = []
+    for i, z_goals in enumerate(bc_lats):
         if found[i] or i == seeking_idx or seek_timeout_cd[i] > 0:
+            detect_streaks[i] = 0
             continue
-        vec  = wp.pos - robot_xy
-        dist = float(np.linalg.norm(vec))
-        if dist > DETECT_DIST:
-            continue
-        bearing = wrap_to_pi(math.atan2(float(vec[1]), float(vec[0])) - robot_yaw)
-        if abs(bearing) <= DETECT_FOV and _detection_los(sm, robot_xy, wp.pos):
-            return i
-    return None
+        zc = z_current.expand(z_goals.shape[0], -1)
+        e_min = float(head(zc, z_goals).min().item())
+        candidates.append((i, e_min))
+
+    if not candidates:
+        return None, None, None
+
+    candidates.sort(key=lambda x: x[1])
+    best_i, best_e = candidates[0]
+    second_e = candidates[1][1] if len(candidates) > 1 else float("inf")
+
+    for i, _ in candidates:
+        if i == best_i and best_e <= DETECT_ENERGY_THRESH and second_e >= best_e + DETECT_ENERGY_MARGIN:
+            detect_streaks[i] += 1
+        else:
+            detect_streaks[i] = max(0, detect_streaks[i] - 1)
+
+    if detect_streaks[best_i] >= DETECT_CONFIRM_STEPS:
+        detect_streaks[best_i] = 0
+        return best_i, best_e, second_e
+    return None, best_e, second_e
 
 
 # --------------------------------------------------------------------------- #
@@ -1260,6 +1279,7 @@ def main():
     seek_ema_e       = 4.0
     seek_timeout_cd  = [0] * len(waypoints)
     seek_fail_counts = [0] * len(waypoints)
+    detect_streaks   = [0] * len(waypoints)
     seek_recent_pos:  Deque[np.ndarray] = deque(maxlen=SEEK_STALL_WINDOW)
     seek_recent_dist: Deque[float]      = deque(maxlen=SEEK_STALL_WINDOW)
     seek_recent_sig:  Deque[np.ndarray] = deque(maxlen=SEEK_STALL_WINDOW)
@@ -1323,29 +1343,52 @@ def main():
 
         # ── Waypoint detection ─────────────────────────────────────────── #
         seek_timeout_cd = [max(0, c - 1) for c in seek_timeout_cd]
-        detected = check_detections(robot_xy, robot_yaw, waypoints, found, seeking_idx,
-                                    sm, seek_timeout_cd)
+        detected, detect_e, detect_second_e = check_detections(
+            z_current, head, bc_lats, found, seeking_idx, seek_timeout_cd, detect_streaks,
+        )
         if detected is not None and seeking_idx < 0:
-            seeking_idx    = detected
-            seek_steps     = 0
-            seek_ema_e     = 4.0
-            prev_cmd       = None
-            guard_steps    = 0
-            wander_steps   = 0
-            stuck_cooldown = 0
-            seek_recent_pos.clear()
-            seek_recent_dist.clear()
-            seek_recent_sig.clear()
-            seek_recovery_cd = 0
-            dist_spotted = float(np.linalg.norm(waypoints[detected].pos - robot_xy))
-            print(f"\n  [SPOTTED] {waypoints[detected].name} at step {step}  "
-                  f"dist={dist_spotted:.2f}m")
-            event_log.append(("SPOTTED",
-                               f"step {step:4d}  SPOTTED {waypoints[detected].name}  {dist_spotted:.1f}m"))
+            detect_wp = waypoints[detected]
+            seek_goal_xy = waypoint_seek_anchor(detect_wp)
+            route_ready = (
+                _frontier_reachable(sm, robot_xy, seek_goal_xy)
+                or bfs_next_waypoint(sm, robot_xy, seek_goal_xy,
+                                     lookahead_m=0.7, allow_unknown=False) is not None
+            )
+            dist_spotted = float(np.linalg.norm(detect_wp.pos - robot_xy))
+            if route_ready:
+                seeking_idx    = detected
+                seek_steps     = 0
+                seek_ema_e     = 4.0
+                prev_cmd       = None
+                guard_steps    = 0
+                wander_steps   = 0
+                stuck_cooldown = 0
+                seek_recent_pos.clear()
+                seek_recent_dist.clear()
+                seek_recent_sig.clear()
+                seek_recovery_cd = 0
+                print(f"\n  [SPOTTED] {detect_wp.name} at step {step}  "
+                      f"dist={dist_spotted:.2f}m  E={detect_e:.2f}")
+                event_log.append((
+                    "SPOTTED",
+                    f"step {step:4d}  SPOTTED {detect_wp.name}  d={dist_spotted:.1f}m  E={detect_e:.2f}",
+                ))
+            else:
+                frontier_xy = seek_goal_xy.astype(np.float32)
+                frontier_age = 0
+                cov_start = cov
+                seek_timeout_cd[detected] = max(seek_timeout_cd[detected], 30)
+                print(f"\n  [GLIMPSED] {detect_wp.name} at step {step}  "
+                      f"dist={dist_spotted:.2f}m  E={detect_e:.2f}  — no free route yet")
+                event_log.append((
+                    "GLIMPSED",
+                    f"step {step:4d}  GLIMPSED {detect_wp.name}  d={dist_spotted:.1f}m  E={detect_e:.2f}",
+                ))
 
         # ── Goal-direction latent selection ────────────────────────────── #
         if seeking_idx >= 0:
-            goal_vec_raw  = waypoints[seeking_idx].pos - robot_xy
+            seek_goal_xy = waypoint_seek_anchor(waypoints[seeking_idx])
+            goal_vec_raw  = seek_goal_xy - robot_xy
             gv_norm = float(np.linalg.norm(goal_vec_raw))
             goal_vec_unit = goal_vec_raw/gv_norm if gv_norm > 1e-6 else np.array([1.,0.])
             dirs_k  = bc_dirs[seeking_idx]
@@ -1476,14 +1519,18 @@ def main():
         elif seeking_idx >= 0:
             # Goal-directed with BFS routing when direct path is wall-blocked.
             wp    = waypoints[seeking_idx]
-            gvec  = wp.pos - robot_xy
+            seek_goal_xy = waypoint_seek_anchor(wp)
+            gvec  = seek_goal_xy - robot_xy
             gdist = float(np.linalg.norm(gvec))
 
-            if not _frontier_reachable(sm, robot_xy, wp.pos):
-                bfs_tgt  = bfs_next_waypoint(sm, robot_xy, wp.pos, lookahead_m=0.7)
-                seek_nav = bfs_tgt if bfs_tgt is not None else wp.pos
+            if not _frontier_reachable(sm, robot_xy, seek_goal_xy):
+                bfs_tgt  = bfs_next_waypoint(
+                    sm, robot_xy, seek_goal_xy,
+                    lookahead_m=0.7, allow_unknown=False,
+                )
+                seek_nav = bfs_tgt if bfs_tgt is not None else seek_goal_xy
             else:
-                seek_nav = wp.pos
+                seek_nav = seek_goal_xy
 
             navvec  = seek_nav - robot_xy
             navdist = float(np.linalg.norm(navvec))
