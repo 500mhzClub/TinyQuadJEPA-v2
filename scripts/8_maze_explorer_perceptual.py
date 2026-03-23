@@ -108,6 +108,10 @@ OCC_INFLATION_RADIUS  = 0.12    # inflate perceived walls from depth only
 
 BRAIN_CAM_FWD_OFFSET = 0.01     # keep the brain camera well inside the body collision hull
 BRAIN_CAM_UP_OFFSET  = 0.09
+BRAIN_CAM_FOV_DEG    = 58.0
+
+DEPTH_OCC_FLOOR_MARGIN_FRAC   = 0.04
+DEPTH_GUARD_FLOOR_MARGIN_FRAC = 0.03
 
 FRONT_STOP_DIST        = 0.28
 FRONT_BLOCKED_FRAC     = 0.35
@@ -220,8 +224,8 @@ def build_scene(waypoints: List[MazeWaypoint]):
             surface=gs.surfaces.Rough(color=wp.color_rgb),
         )
 
-    cam_brain = scene.add_camera(res=(64, 64),   fov=58)
-    cam_eye   = scene.add_camera(res=(384, 384), fov=58)
+    cam_brain = scene.add_camera(res=(64, 64),   fov=BRAIN_CAM_FOV_DEG)
+    cam_eye   = scene.add_camera(res=(384, 384), fov=BRAIN_CAM_FOV_DEG)
     cam_over  = scene.add_camera(res=(512, 512), fov=55)
 
     scene.build()
@@ -257,7 +261,8 @@ def move_cams(robot, cam_brain, cam_eye, cam_over):
     cam_over.set_pose(pos=over_pos, lookat=over_lk,
                       up=np.array([0.0, 0.0, 1.0], dtype=np.float32))
     yaw = math.atan2(float(fw[1]), float(fw[0]))
-    return p, yaw
+    pitch = math.asin(clamp(-float(fw[2]), -1.0, 1.0))
+    return p, yaw, brain_pos, pitch
 
 
 def render_rgb(cam) -> np.ndarray:
@@ -468,15 +473,53 @@ def normalize_depth_image(depth_img, depth_max):
     return d
 
 
-def depth_guard_stats(depth_img, depth_max):
+def projected_floor_row_fraction(cam_pitch_rad, cam_height_m, depth_max, fov_deg):
+    """Normalized image row where the floor at depth_max first becomes visible."""
+    if cam_height_m is None or cam_height_m <= 1e-4:
+        return 1.0
+    pitch = 0.0 if cam_pitch_rad is None else float(cam_pitch_rad)
+    vfov_rad = math.radians(max(float(fov_deg), 1e-3))
+    floor_drop = math.atan2(max(float(cam_height_m), 1e-4), max(float(depth_max), 1e-3))
+    return clamp(0.5 + (floor_drop + pitch) / vfov_rad, 0.0, 1.0)
+
+
+def floor_safe_row_bounds(
+    h,
+    row_lo_frac,
+    row_hi_cap_frac,
+    depth_max,
+    *,
+    cam_pitch_rad=None,
+    cam_height_m=None,
+    fov_deg=BRAIN_CAM_FOV_DEG,
+    floor_margin_frac=DEPTH_OCC_FLOOR_MARGIN_FRAC,
+):
+    row_lo = max(0, int(row_lo_frac * h))
+    row_hi_frac = row_hi_cap_frac
+    if cam_pitch_rad is not None and cam_height_m is not None:
+        floor_row = projected_floor_row_fraction(
+            cam_pitch_rad, cam_height_m, depth_max, fov_deg,
+        )
+        row_hi_frac = min(row_hi_frac, floor_row - floor_margin_frac)
+    row_hi = min(h, int(clamp(row_hi_frac, 0.0, 1.0) * h))
+    if row_hi <= row_lo:
+        row_hi = min(h, row_lo + max(1, int(0.04 * h)))
+    return row_lo, row_hi
+
+
+def depth_guard_stats(depth_img, depth_max, cam_pitch_rad=None, cam_height_m=None,
+                      fov_deg=BRAIN_CAM_FOV_DEG):
     d = normalize_depth_image(depth_img, depth_max)
     if d is None:
         return None
     h, w = d.shape
-    row_lo = max(0, int(0.10 * h))
-    row_hi = min(h, int(0.70 * h))
-    if row_hi <= row_lo:
-        row_lo, row_hi = 0, h
+    row_lo, row_hi = floor_safe_row_bounds(
+        h, 0.10, 0.70, depth_max,
+        cam_pitch_rad=cam_pitch_rad,
+        cam_height_m=cam_height_m,
+        fov_deg=fov_deg,
+        floor_margin_frac=DEPTH_GUARD_FLOOR_MARGIN_FRAC,
+    )
     c0 = max(0, int(0.30 * w))
     c1 = min(w, max(c0 + 1, int(0.70 * w)))
     left   = d[row_lo:row_hi, :max(1, w // 3)]
@@ -490,8 +533,14 @@ def depth_guard_stats(depth_img, depth_max):
     }
 
 
-def depth_view_signature(depth_img, depth_max):
-    stats = depth_guard_stats(depth_img, depth_max)
+def depth_view_signature(depth_img, depth_max, cam_pitch_rad=None, cam_height_m=None,
+                         fov_deg=BRAIN_CAM_FOV_DEG):
+    stats = depth_guard_stats(
+        depth_img, depth_max,
+        cam_pitch_rad=cam_pitch_rad,
+        cam_height_m=cam_height_m,
+        fov_deg=fov_deg,
+    )
     if stats is None:
         return None
     return np.array(
@@ -500,8 +549,14 @@ def depth_view_signature(depth_img, depth_max):
     )
 
 
-def front_blocked_from_depth(depth_img, depth_max) -> bool:
-    stats = depth_guard_stats(depth_img, depth_max)
+def front_blocked_from_depth(depth_img, depth_max, cam_pitch_rad=None, cam_height_m=None,
+                             fov_deg=BRAIN_CAM_FOV_DEG) -> bool:
+    stats = depth_guard_stats(
+        depth_img, depth_max,
+        cam_pitch_rad=cam_pitch_rad,
+        cam_height_m=cam_height_m,
+        fov_deg=fov_deg,
+    )
     if stats is None:
         return False
     return (
@@ -511,8 +566,15 @@ def front_blocked_from_depth(depth_img, depth_max) -> bool:
 
 
 def make_escape_cmd_from_depth(depth_img, depth_max, dev,
-                               reverse_speed=-0.15, turn_speed=0.55):
-    stats = depth_guard_stats(depth_img, depth_max)
+                               reverse_speed=-0.15, turn_speed=0.55,
+                               cam_pitch_rad=None, cam_height_m=None,
+                               fov_deg=BRAIN_CAM_FOV_DEG):
+    stats = depth_guard_stats(
+        depth_img, depth_max,
+        cam_pitch_rad=cam_pitch_rad,
+        cam_height_m=cam_height_m,
+        fov_deg=fov_deg,
+    )
     if stats is None:
         return torch.tensor([[reverse_speed, 0.0, abs(turn_speed)]], device=dev, dtype=torch.float32)
     if stats["left_med"] > stats["right_med"] + 0.08:
@@ -524,14 +586,21 @@ def make_escape_cmd_from_depth(depth_img, depth_max, dev,
     return torch.tensor([[reverse_speed, 0.0, wz]], device=dev, dtype=torch.float32)
 
 
-def reinforce_front_obstacle(sm, robot_xy, robot_yaw, depth_img, depth_max):
+def reinforce_front_obstacle(sm, robot_xy, robot_yaw, depth_img, depth_max,
+                             cam_pitch_rad=None, cam_height_m=None,
+                             fov_deg=BRAIN_CAM_FOV_DEG):
     d = normalize_depth_image(depth_img, depth_max)
     if d is None:
         hit_dist = FRONT_STOP_DIST
     else:
         h, w = d.shape
-        row_lo = max(0, int(0.12 * h))
-        row_hi = min(h, int(0.62 * h))
+        row_lo, row_hi = floor_safe_row_bounds(
+            h, 0.12, 0.62, depth_max,
+            cam_pitch_rad=cam_pitch_rad,
+            cam_height_m=cam_height_m,
+            fov_deg=fov_deg,
+            floor_margin_frac=DEPTH_GUARD_FLOOR_MARGIN_FRAC,
+        )
         c0 = max(0, int(0.44 * w))
         c1 = min(w, max(c0 + 1, int(0.56 * w)))
         center = d[row_lo:row_hi, c0:c1]
@@ -542,7 +611,8 @@ def reinforce_front_obstacle(sm, robot_xy, robot_yaw, depth_img, depth_max):
         mark_disc(sm, hit_xy, max(OCC_INFLATION_RADIUS, 0.14), MAP_OCC)
 
 
-def update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth_img, fov_deg, depth_max):
+def update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth_img, fov_deg, depth_max,
+                                 cam_pitch_rad=None, cam_height_m=None):
     """Update occupancy purely from depth.  OCC uses vote accumulation."""
     mark_disc(sm, robot_xy, ROBOT_SELF_FREE_RADIUS, MAP_FREE)
 
@@ -561,8 +631,13 @@ def update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth_img, fov_deg, de
     # These rows correspond to roughly horizontal or upward-facing rays and
     # will NOT hit the floor within depth_max.  Rows below this line look
     # downward and produce ground-return false positives.
-    row_lo = max(0,   int(0.02 * h))   # skip very top-edge artefacts
-    row_hi = min(h,   int(0.66 * h))   # cut before floor-hitting rays
+    row_lo, row_hi = floor_safe_row_bounds(
+        h, 0.02, 0.62, depth_max,
+        cam_pitch_rad=cam_pitch_rad,
+        cam_height_m=cam_height_m,
+        fov_deg=fov_deg,
+        floor_margin_frac=DEPTH_OCC_FLOOR_MARGIN_FRAC,
+    )
 
     cols = np.unique(np.clip(np.linspace(int(0.08*w), int(0.92*w), 41).astype(int), 0, w-1))
     for c in cols:
@@ -1556,8 +1631,9 @@ def main():
     for step in range(args.n_steps):
 
         # Camera + robot pose.
-        robot_pos_3d, robot_yaw = move_cams(robot, cam_brain, cam_eye, cam_over)
+        robot_pos_3d, robot_yaw, brain_pos, cam_pitch = move_cams(robot, cam_brain, cam_eye, cam_over)
         robot_xy = robot_pos_3d[:2].astype(np.float32)
+        cam_height = float(max(brain_pos[2], 0.02))
 
         # ── Clip detection: physics has pushed robot into a perceived wall ─ #
         if sample_cell(sm, robot_xy) == MAP_OCC and clip_retreat_steps <= 0:
@@ -1570,9 +1646,16 @@ def main():
             z_target_current = jepa.encode_target(vis, prop).detach()
 
         # Update occupancy map from depth only.
-        update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth,
-                                     fov_deg=58.0, depth_max=args.depth_max)
-        depth_sig = depth_view_signature(depth, args.depth_max)
+        update_sensor_map_from_depth(
+            sm, robot_xy, robot_yaw, depth,
+            fov_deg=BRAIN_CAM_FOV_DEG, depth_max=args.depth_max,
+            cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
+        )
+        depth_sig = depth_view_signature(
+            depth, args.depth_max,
+            cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
+            fov_deg=BRAIN_CAM_FOV_DEG,
+        )
         cov = coverage_percent(sm)
         trail.append(robot_xy.copy())
         recent_pos.append(robot_xy.copy())
@@ -1748,17 +1831,27 @@ def main():
             seek_disp = float(np.linalg.norm(seek_recent_pos[-1] - seek_recent_pos[0]))
             seek_progress = float(seek_recent_dist[0] - seek_recent_dist[-1])
             sig_delta = 999.0
-            front_blocked = front_blocked_from_depth(depth, args.depth_max)
+            front_blocked = front_blocked_from_depth(
+                depth, args.depth_max,
+                cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
+                fov_deg=BRAIN_CAM_FOV_DEG,
+            )
             if len(seek_recent_sig) == seek_recent_sig.maxlen:
                 sig_delta = float(np.max(np.abs(seek_recent_sig[-1] - seek_recent_sig[0])))
             if (seek_disp < SEEK_STALL_DISP
                     and seek_progress < SEEK_STALL_PROGRESS
                     and front_blocked
                     and sig_delta < SEEK_STALL_DEPTH_DELTA):
-                reinforce_front_obstacle(sm, robot_xy, robot_yaw, depth, args.depth_max)
+                reinforce_front_obstacle(
+                    sm, robot_xy, robot_yaw, depth, args.depth_max,
+                    cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
+                    fov_deg=BRAIN_CAM_FOV_DEG,
+                )
                 guard_cmd = make_escape_cmd_from_depth(
                     depth, args.depth_max, dev,
                     reverse_speed=-0.18, turn_speed=0.60,
+                    cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
+                    fov_deg=BRAIN_CAM_FOV_DEG,
                 )
                 guard_steps = 12
                 seek_steps = min(MAX_SEEK_STEPS, seek_steps + 35)
@@ -1907,6 +2000,8 @@ def main():
                 guard_cmd = make_escape_cmd_from_depth(
                     depth, args.depth_max, dev,
                     reverse_speed=-0.22, turn_speed=0.80,
+                    cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
+                    fov_deg=BRAIN_CAM_FOV_DEG,
                 )
                 guard_steps = 12
                 stuck_count = 0
@@ -1942,7 +2037,11 @@ def main():
             left_vec = np.array([-math.sin(robot_yaw),  math.cos(robot_yaw)], np.float32)
             occ_count = sum(1 for d in (0.12, 0.20, 0.30)
                            if sample_occ_with_clearance(sm, robot_xy + d * fwd_vec, radius=0.06))
-            depth_blocked = front_blocked_from_depth(depth, args.depth_max)
+            depth_blocked = front_blocked_from_depth(
+                depth, args.depth_max,
+                cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
+                fov_deg=BRAIN_CAM_FOV_DEG,
+            )
             left_occ = sample_occ_with_clearance(sm, robot_xy + 0.14 * left_vec, radius=0.08)
             right_occ = sample_occ_with_clearance(sm, robot_xy - 0.14 * left_vec, radius=0.08)
 
@@ -1961,11 +2060,17 @@ def main():
 
             if float(cmd[0, 0].item()) > 0.02 and (occ_count >= 2 or depth_blocked):
                 if depth_blocked:
-                    reinforce_front_obstacle(sm, robot_xy, robot_yaw, depth, args.depth_max)
+                    reinforce_front_obstacle(
+                        sm, robot_xy, robot_yaw, depth, args.depth_max,
+                        cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
+                        fov_deg=BRAIN_CAM_FOV_DEG,
+                    )
                 cmd = make_escape_cmd_from_depth(
                     depth, args.depth_max, dev,
                     reverse_speed=(-0.16 if seeking_idx >= 0 else -0.12),
                     turn_speed=0.65,
+                    cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
+                    fov_deg=BRAIN_CAM_FOV_DEG,
                 )
                 guard_steps = 9 if seeking_idx >= 0 else 5
                 guard_steps -= 1
@@ -1988,6 +2093,8 @@ def main():
                     guard_cmd = make_escape_cmd_from_depth(
                         depth, args.depth_max, dev,
                         reverse_speed=-0.22, turn_speed=0.80,
+                        cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
+                        fov_deg=BRAIN_CAM_FOV_DEG,
                     )
                     guard_steps = 16
                     stuck_cooldown = max(stuck_cooldown, 60)
