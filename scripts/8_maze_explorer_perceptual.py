@@ -92,6 +92,11 @@ DETECT_STRIDE         = 4
 GLIMPSE_COOLDOWN      = 45
 PROXY_ROUTE_RADIUS    = 0.45
 BREADCRUMB_YAW_OFFSETS_DEG = (-28.0, -12.0, 0.0, 12.0, 28.0)
+LATENT_MEMORY_MAX = 512
+LATENT_MEMORY_STRIDE = 4
+LATENT_MEMORY_MIN_STEP_DIST = 0.10
+LATENT_MEMORY_MIN_COS = 0.985
+LATENT_NOVELTY_WEIGHT = 2.20
 
 # ── Perceptual OCC parameters ──────────────────────────────────────────── #
 OCC_VOTE_THRESH = 4     # hits needed before a cell is promoted to MAP_OCC
@@ -891,6 +896,48 @@ def local_unknown_gain_batched_torch(sm, end_xy_t, unknown_grid=None, radius=0.5
     return counts * 0.08
 
 
+def normalize_latents_t(latents: torch.Tensor) -> torch.Tensor:
+    return latents / latents.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+
+def latent_bank_novelty_torch(
+    latents: torch.Tensor,
+    memory_bank_norm: Optional[torch.Tensor],
+) -> torch.Tensor:
+    if memory_bank_norm is None or memory_bank_norm.numel() == 0:
+        return torch.ones(latents.shape[0], device=latents.device, dtype=latents.dtype)
+    sims = normalize_latents_t(latents) @ memory_bank_norm.t()
+    max_sim = sims.max(dim=1).values
+    return (1.0 - max_sim).clamp_min(0.0)
+
+
+@torch.no_grad()
+def maybe_add_latent_memory(
+    memory_bank: Optional[torch.Tensor],
+    memory_bank_norm: Optional[torch.Tensor],
+    z_target: torch.Tensor,
+    max_size: int = LATENT_MEMORY_MAX,
+    min_cos: float = LATENT_MEMORY_MIN_COS,
+):
+    z = z_target.detach()
+    if z.dim() == 1:
+        z = z.unsqueeze(0)
+    z = z[:1]
+    z_norm = normalize_latents_t(z)
+
+    if memory_bank_norm is not None and memory_bank_norm.numel() > 0:
+        max_sim = float((z_norm @ memory_bank_norm.t()).max().item())
+        if max_sim >= min_cos:
+            return memory_bank, memory_bank_norm, False
+
+    if memory_bank is None or memory_bank.numel() == 0:
+        return z.clone(), z_norm.clone(), True
+
+    memory_bank = torch.cat([memory_bank, z], dim=0)[-max_size:]
+    memory_bank_norm = torch.cat([memory_bank_norm, z_norm], dim=0)[-max_size:]
+    return memory_bank, memory_bank_norm, True
+
+
 # --------------------------------------------------------------------------- #
 # Breadcrumb harvesting
 # --------------------------------------------------------------------------- #
@@ -1068,13 +1115,13 @@ def _kin_path(start_xy, start_yaw, cmd, horizon, dt=0.10):
 # --------------------------------------------------------------------------- #
 
 @torch.no_grad()
-def plan_explore_cmd(jepa, head, zc, z_explore, sm, robot_xy, robot_yaw, frontier_xy,
+def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, frontier_xy,
                      prev_cmd, cands, hz, dev):
     goal_vec  = frontier_xy - robot_xy
     goal_dist = float(np.linalg.norm(goal_vec))
     if goal_dist < 1e-6:
-        wander = torch.tensor([[0.20, 0.0, 0.55]], device=dev, dtype=torch.float32)
-        return wander, np.zeros((hz, 2), np.float32)
+        nudge = torch.tensor([[0.16, 0.0, 0.45]], device=dev, dtype=torch.float32)
+        return nudge, np.zeros((hz, 2), np.float32)
 
     hdg_err = wrap_to_pi(math.atan2(float(goal_vec[1]), float(goal_vec[0])) - robot_yaw)
     far = goal_dist > 0.8
@@ -1104,19 +1151,27 @@ def plan_explore_cmd(jepa, head, zc, z_explore, sm, robot_xy, robot_yaw, frontie
     grid_t       = torch.as_tensor(sm.grid, device=dev)
     occ_grid     = grid_t == MAP_OCC
     unknown_grid = grid_t == MAP_UNKNOWN
+    novelty_steps = {
+        max(0, hz // 3 - 1),
+        max(0, (2 * hz) // 3 - 1),
+        hz - 1,
+    }
 
     for _ in range(4):
         cmds = mean + std * torch.randn((cands, 3), device=dev)
-        cmds[:, 0].clamp_(0.0, 0.40)
+        cmds[:, 0].clamp_(-0.08, 0.40)
         cmds[:, 1].clamp_(-0.20, 0.20)
         cmds[:, 2].clamp_(-0.70, 0.70)
 
         z_roll = zc.expand(cands, -1)
         h_t    = torch.zeros((cands, jepa.latent_dim), device=dev, dtype=z_roll.dtype)
-        for _ in range(hz):
+        novelty_terms = []
+        for t in range(hz):
             z_roll, h_t = jepa.predictor(z_roll, cmds, h_t)
-
-        ebm_cost = head(z_roll, z_explore.expand_as(z_roll)) * 0.35
+            if t in novelty_steps:
+                novelty_terms.append(latent_bank_novelty_torch(z_roll, latent_memory_norm))
+        novelty_t = (torch.stack(novelty_terms, dim=1).mean(dim=1)
+                     if novelty_terms else torch.ones(cands, device=dev, dtype=zc.dtype))
 
         paths_t, end_xy_t = rollout_cmds_batched_paths(robot_xy, robot_yaw, cmds, hz)
         prog_t   = goal_dist - (end_xy_t - frontier_t).norm(dim=1)
@@ -1127,12 +1182,15 @@ def plan_explore_cmd(jepa, head, zc, z_explore, sm, robot_xy, robot_yaw, frontie
                   else 0.10 * (cmds - prev_cmd).pow(2).sum(dim=-1))
 
         cost = (coll_t
-                + ebm_cost
                 + smooth
                 + 0.50 * cmds[:, 1].abs()
+                + 0.10 * cmds[:, 2].abs()
+                + 0.25 * (-cmds[:, 0]).clamp_min(0.0)
                 + (cmds[:, 0] < 0.02).float() * 0.10
-                - 3.0 * prog_t
-                - 0.80 * front_t)
+                - 2.40 * prog_t
+                - 0.90 * front_t
+                - LATENT_NOVELTY_WEIGHT * novelty_t
+                - 0.20 * cmds[:, 0].clamp_min(0.0))
 
         k = max(8, cands // 10)
         elite = torch.topk(cost, k=k, largest=False).indices
@@ -1421,10 +1479,6 @@ def main():
         bc_dirs.append(d)
         bc_lats.append(z)
 
-    print("Harvesting exploration reference (forward locomotion) ...")
-    z_explore = harvest_explore_reference(robot, cam_brain, q0, jepa, ppo, dofs, dev, scene)
-    print(f"  z_explore norm={float(z_explore.norm()):.3f}\n")
-
     # ── Reset — the harvest teleports shouldn't pre-build the wall map ────  #
     sm = make_sensor_map(args.map_res)
 
@@ -1437,6 +1491,9 @@ def main():
     # ── Navigation state ─────────────────────────────────────────────────  #
     prev_action = torch.zeros((1,12), device=dev)
     prev_cmd:   Optional[torch.Tensor] = None
+    latent_memory: Optional[torch.Tensor] = None
+    latent_memory_norm: Optional[torch.Tensor] = None
+    last_memory_xy = np.array(ROBOT_SPAWN[:2], np.float32)
 
     trail:      List[np.ndarray] = []
     recent_pos: Deque[np.ndarray] = deque(maxlen=18)
@@ -1468,8 +1525,6 @@ def main():
     guard_cmd         = torch.zeros((1,3), device=dev)
     stuck_count       = 0
     stuck_cooldown    = 0
-    wander_steps      = 0
-    wander_cmd        = torch.zeros((1,3), device=dev)
     clip_retreat_steps = 0
 
     discoveries: List[dict] = []
@@ -1503,6 +1558,7 @@ def main():
         vis, prop, _, depth = get_jepa_state(robot, cam_brain, q0, prev_action, dofs, dev)
         with torch.no_grad():
             z_current = jepa.encode_online(vis, prop).detach()
+            z_target_current = jepa.encode_target(vis, prop).detach()
 
         # Update occupancy map from depth only.
         update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth,
@@ -1513,6 +1569,15 @@ def main():
         recent_pos.append(robot_xy.copy())
         recent_cov.append(cov)
 
+        if step == 0 or step % LATENT_MEMORY_STRIDE == 0:
+            mem_disp = float(np.linalg.norm(robot_xy - last_memory_xy))
+            if latent_memory is None or mem_disp >= LATENT_MEMORY_MIN_STEP_DIST:
+                latent_memory, latent_memory_norm, added = maybe_add_latent_memory(
+                    latent_memory, latent_memory_norm, z_target_current,
+                )
+                if added:
+                    last_memory_xy = robot_xy.copy()
+
         # ── Waypoint detection ─────────────────────────────────────────── #
         seek_timeout_cd = [max(0, c - 1) for c in seek_timeout_cd]
         glimpse_timeout_cd = [max(0, c - 1) for c in glimpse_timeout_cd]
@@ -1520,7 +1585,7 @@ def main():
         detect_e = None
         detect_second_e = None
         detect_kind = None
-        if (seeking_idx < 0 and guard_steps <= 0 and wander_steps <= 0 and clip_retreat_steps <= 0
+        if (seeking_idx < 0 and guard_steps <= 0 and clip_retreat_steps <= 0
                 and step % DETECT_STRIDE == 0):
             detected, detect_e, detect_second_e, detect_kind = check_detections(
                 z_current, head, bc_lats, found, seeking_idx,
@@ -1553,7 +1618,6 @@ def main():
                 seek_ema_e     = 4.0
                 prev_cmd       = None
                 guard_steps    = 0
-                wander_steps   = 0
                 stuck_cooldown = 0
                 seek_recent_pos.clear()
                 seek_recent_dist.clear()
@@ -1668,7 +1732,7 @@ def main():
         # ── Seek stall recovery ────────────────────────────────────────── #
         if seek_recovery_cd > 0:
             seek_recovery_cd -= 1
-        if (seeking_idx >= 0 and guard_steps <= 0 and wander_steps <= 0
+        if (seeking_idx >= 0 and guard_steps <= 0
                 and clip_retreat_steps <= 0 and seek_recovery_cd <= 0
                 and len(seek_recent_pos) == seek_recent_pos.maxlen
                 and len(seek_recent_dist) == seek_recent_dist.maxlen):
@@ -1708,8 +1772,6 @@ def main():
             clip_retreat_steps -= 1; plan_path = None
         elif guard_steps > 0:
             cmd = guard_cmd; guard_steps -= 1; plan_path = None
-        elif wander_steps > 0:
-            cmd = wander_cmd; wander_steps -= 1; plan_path = None
         elif seeking_idx >= 0:
             # Goal-directed with BFS routing when direct path is wall-blocked.
             wp    = waypoints[seeking_idx]
@@ -1740,7 +1802,7 @@ def main():
                         seek_recovery_cd = 0
                         nav_target = frontier_xy
                         cmd, plan_path = plan_explore_cmd(
-                            jepa, head, z_current, z_explore, sm,
+                            jepa, z_current, latent_memory_norm, sm,
                             robot_xy, robot_yaw, nav_target, prev_cmd,
                             args.cands, args.horizon, dev,
                         )
@@ -1764,7 +1826,7 @@ def main():
                     )
                 else:
                     cmd, plan_path = plan_explore_cmd(
-                        jepa, head, z_current, z_explore, sm,
+                        jepa, z_current, latent_memory_norm, sm,
                         robot_xy, robot_yaw, seek_nav, prev_cmd,
                         args.cands, args.horizon, dev,
                     )
@@ -1819,30 +1881,35 @@ def main():
                 nav_target = frontier_xy
 
             cmd, plan_path = plan_explore_cmd(
-                jepa, head, z_current, z_explore, sm, robot_xy, robot_yaw,
+                jepa, z_current, latent_memory_norm, sm, robot_xy, robot_yaw,
                 nav_target, prev_cmd, args.cands, args.horizon, dev,
             )
             prev_cmd = cmd.clone()
 
-        # ── Stuck detection (skipped during seek — planner handles it) ─── #
+        # ── Stuck detection (skipped during seek — use a short safety retreat) ─── #
         disp = (float(np.linalg.norm(recent_pos[-1]-recent_pos[0]))
                 if len(recent_pos) >= recent_pos.maxlen else 1.0)
         if stuck_cooldown > 0:
             stuck_cooldown -= 1
-        if guard_steps <= 0 and wander_steps <= 0 and stuck_cooldown <= 0 and disp < 0.12 and seeking_idx < 0:
+        if guard_steps <= 0 and stuck_cooldown <= 0 and disp < 0.12 and seeking_idx < 0:
             stuck_count += 1
             frontier_bl.append(frontier_xy.copy())
             if stuck_count >= 3:
-                wander_angle = robot_yaw + float(np.random.uniform(-math.pi, math.pi))
-                delta_yaw    = wrap_to_pi(wander_angle - robot_yaw)
-                wander_cmd   = torch.tensor([[
-                    0.22, 0.0,
-                    float(np.clip(delta_yaw * 0.55, -0.65, 0.65)),
-                ]], device=dev, dtype=torch.float32)
-                wander_steps = 25; stuck_count = 0; stuck_cooldown = 55
-                frontier_bl = frontier_bl[-10:]
+                guard_cmd = make_escape_cmd_from_depth(
+                    depth, args.depth_max, dev,
+                    reverse_speed=-0.22, turn_speed=0.80,
+                )
+                guard_steps = 12
+                stuck_count = 0
+                stuck_cooldown = 65
+                frontier_bl = frontier_bl[-12:]
+                frontier_xy, _ = select_frontier(sm, robot_xy, frontier_bl)
+                frontier_age = 0
+                cov_start = cov
+                prev_cmd = None
+                plan_path = None
             else:
-                _, depth_now = render_rgb_depth(cam_brain)
+                depth_now = depth
                 if depth_now is not None:
                     h, w = depth_now.shape[:2]
                     band  = depth_now[int(0.45*h):int(0.90*h), :]
@@ -1861,7 +1928,7 @@ def main():
             if disp >= 0.12: stuck_count = max(0, stuck_count - 1)
 
         # ── Perception safety filter (seek + explore) ─────────────────── #
-        if guard_steps <= 0 and wander_steps <= 0 and clip_retreat_steps <= 0:
+        if guard_steps <= 0 and clip_retreat_steps <= 0:
             fwd_vec = np.array([math.cos(robot_yaw), math.sin(robot_yaw)], np.float32)
             left_vec = np.array([-math.sin(robot_yaw),  math.cos(robot_yaw)], np.float32)
             occ_count = sum(1 for d in (0.12, 0.20, 0.30)
@@ -1906,14 +1973,14 @@ def main():
                 )
                 if local_guard_hits >= 4:
                     frontier_bl.append(frontier_xy.copy())
+                    frontier_xy, _ = select_frontier(sm, robot_xy, frontier_bl[-12:])
                     frontier_age = 0
                     cov_start = cov
-                    wander_cmd = make_escape_cmd_from_depth(
+                    guard_cmd = make_escape_cmd_from_depth(
                         depth, args.depth_max, dev,
                         reverse_speed=-0.22, turn_speed=0.80,
                     )
-                    wander_steps = 16
-                    guard_steps = 0
+                    guard_steps = 16
                     stuck_cooldown = max(stuck_cooldown, 60)
                     if seeking_idx >= 0:
                         seek_timeout_cd[seeking_idx] = max(seek_timeout_cd[seeking_idx], 60)
@@ -1922,8 +1989,8 @@ def main():
                         seek_recent_dist.clear()
                         seek_recent_sig.clear()
                         seek_recovery_cd = 0
-                    prev_cmd = wander_cmd.clone()
-                    cmd = wander_cmd
+                    prev_cmd = None
+                    cmd = guard_cmd
                 prev_cmd = cmd.clone()
                 plan_path = None
 
@@ -1959,8 +2026,6 @@ def main():
             cv = cmd[0].cpu().numpy()
             if guard_steps > 0:
                 mode_dbg = f"GUARD({guard_steps})"
-            elif wander_steps > 0:
-                mode_dbg = f"WANDER({wander_steps})"
             elif seeking_idx >= 0:
                 mode_dbg = f"SEEK:{waypoints[seeking_idx].name}"
             else:
@@ -1974,6 +2039,7 @@ def main():
                   f"  yaw={math.degrees(robot_yaw):+.0f}deg"
                   f"  cmd=[{cv[0]:+.2f},{cv[1]:+.2f},{cv[2]:+.2f}]"
                   f"  disp={disp:.2f}  cov={cov:.1f}%  cd={stuck_cooldown}"
+                  f"  mem={0 if latent_memory is None else int(latent_memory.shape[0])}"
                   f"  {mode_dbg}")
 
     if writer: writer.close()
