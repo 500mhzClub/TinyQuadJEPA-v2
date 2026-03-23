@@ -81,10 +81,10 @@ ROBOT_SPAWN = (0.5, -0.5, 0.12)
 DETECT_DIST  = 2.2   # metres
 DETECT_FOV   = 0.90  # radians half-angle (~52°)
 ARRIVE_DIST  = 0.45  # metres — waypoint claimed
-MAX_SEEK_STEPS = 400
-DETECT_ENERGY_THRESH  = -0.35
-DETECT_ENERGY_MARGIN  = 0.35
-DETECT_CONFIRM_STEPS  = 5
+MAX_SEEK_STEPS = 220
+DETECT_ENERGY_THRESH  = -1.20
+DETECT_ENERGY_MARGIN  = 0.50
+DETECT_CONFIRM_STEPS  = 8
 
 # ── Perceptual OCC parameters ──────────────────────────────────────────── #
 OCC_VOTE_THRESH = 4     # hits needed before a cell is promoted to MAP_OCC
@@ -414,6 +414,25 @@ def sample_occ_with_clearance(sm, xy, radius=ROBOT_CLEARANCE_RADIUS) -> bool:
     return False
 
 
+def sample_traversable_with_clearance(sm, xy, radius=ROBOT_CLEARANCE_RADIUS, allow_unknown=False) -> bool:
+    g = world_to_grid(sm, xy)
+    if g is None:
+        return False
+    rr = max(0, int(math.ceil(radius / sm.res)))
+    r0, c0 = g
+    for r in range(max(0, r0 - rr), min(sm.h, r0 + rr + 1)):
+        for c in range(max(0, c0 - rr), min(sm.w, c0 + rr + 1)):
+            p = grid_to_world(sm, (r, c))
+            if float(np.linalg.norm(p - xy[:2])) > radius:
+                continue
+            cell = int(sm.grid[r, c])
+            if cell == MAP_OCC:
+                return False
+            if not allow_unknown and cell != MAP_FREE:
+                return False
+    return True
+
+
 def coverage_percent(sm):
     return 100.0 * float(np.count_nonzero(sm.grid != MAP_UNKNOWN)) / float(sm.grid.size)
 
@@ -549,18 +568,26 @@ def update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth_img, fov_deg, de
             mark_disc(sm, robot_xy + ray_dir * dist, OCC_INFLATION_RADIUS, MAP_OCC)
 
 
-def _frontier_reachable(sm, robot_xy, target_xy, n_samples=10):
-    """True if the straight line robot→target doesn't cross any OCC cell."""
+def _frontier_reachable(sm, robot_xy, target_xy, n_samples=10, allow_unknown=False):
+    """True if the straight line robot→target stays traversable."""
     seg = target_xy - robot_xy
     dist = float(np.linalg.norm(seg))
     if dist < 1e-6:
-        return True
+        return sample_traversable_with_clearance(sm, robot_xy, allow_unknown=allow_unknown)
+    if not sample_traversable_with_clearance(sm, robot_xy, allow_unknown=allow_unknown):
+        return False
+    if not sample_traversable_with_clearance(sm, target_xy, allow_unknown=allow_unknown):
+        return False
     n_samples = max(
         int(n_samples),
         int(math.ceil(dist / max(LINE_CHECK_STEP_M, sm.res * 0.5))),
     )
     for t in np.linspace(0.05, 0.95, n_samples):
-        if sample_occ_with_clearance(sm, robot_xy + t * (target_xy - robot_xy)):
+        if not sample_traversable_with_clearance(
+            sm,
+            robot_xy + t * (target_xy - robot_xy),
+            allow_unknown=allow_unknown,
+        ):
             return False
     return True
 
@@ -1475,7 +1502,7 @@ def main():
             seek_goal_xy = waypoint_seek_anchor(detect_wp)
             proxy_goal_xy = select_goal_proxy(sm, robot_xy, seek_goal_xy, frontier_bl)
             route_ready = (
-                _frontier_reachable(sm, robot_xy, seek_goal_xy)
+                _frontier_reachable(sm, robot_xy, seek_goal_xy, allow_unknown=False)
                 or bfs_next_waypoint(sm, robot_xy, seek_goal_xy,
                                      lookahead_m=0.7, allow_unknown=False) is not None
             )
@@ -1499,9 +1526,10 @@ def main():
                     f"step {step:4d}  SPOTTED {detect_wp.name}  d={dist_spotted:.1f}m  E={detect_e:.2f}",
                 ))
             else:
-                frontier_xy = (proxy_goal_xy if proxy_goal_xy is not None else seek_goal_xy).astype(np.float32)
-                frontier_age = 0
-                cov_start = cov
+                if proxy_goal_xy is not None:
+                    frontier_xy = proxy_goal_xy.astype(np.float32)
+                    frontier_age = 0
+                    cov_start = cov
                 seek_timeout_cd[detected] = max(seek_timeout_cd[detected], 30)
                 print(f"\n  [GLIMPSED] {detect_wp.name} at step {step}  "
                       f"dist={dist_spotted:.2f}m  E={detect_e:.2f}  — no free route yet")
@@ -1649,7 +1677,7 @@ def main():
             gdist = float(np.linalg.norm(gvec))
             use_seek_planner = True
 
-            if not _frontier_reachable(sm, robot_xy, seek_goal_xy):
+            if not _frontier_reachable(sm, robot_xy, seek_goal_xy, allow_unknown=False):
                 bfs_tgt  = bfs_next_waypoint(
                     sm, robot_xy, seek_goal_xy,
                     lookahead_m=0.7, allow_unknown=False,
@@ -1658,30 +1686,48 @@ def main():
                     seek_nav = bfs_tgt
                 else:
                     proxy_tgt = select_goal_proxy(sm, robot_xy, seek_goal_xy, frontier_bl)
-                    seek_nav = proxy_tgt if proxy_tgt is not None else seek_goal_xy
-                    use_seek_planner = False
+                    if proxy_tgt is not None:
+                        seek_nav = proxy_tgt
+                        use_seek_planner = False
+                    else:
+                        seek_timeout_cd[seeking_idx] = max(seek_timeout_cd[seeking_idx], 45)
+                        seeking_idx = -1
+                        prev_cmd = None
+                        seek_recent_pos.clear()
+                        seek_recent_dist.clear()
+                        seek_recent_sig.clear()
+                        seek_recovery_cd = 0
+                        nav_target = frontier_xy
+                        cmd, plan_path = plan_explore_cmd(
+                            jepa, head, z_current, z_explore, sm,
+                            robot_xy, robot_yaw, nav_target, prev_cmd,
+                            args.cands, args.horizon, dev,
+                        )
+                        prev_cmd = cmd.clone()
+                        use_seek_planner = None
             else:
                 seek_nav = seek_goal_xy
 
-            navvec  = seek_nav - robot_xy
-            navdist = float(np.linalg.norm(navvec))
-            navdir  = navvec / max(navdist, 1e-8)
-            gbody   = world_to_body_xy(robot_yaw, navdir)
-            gang    = math.atan2(float(navvec[1]), float(navvec[0]))
-            herr    = wrap_to_pi(gang - robot_yaw)
-            if use_seek_planner:
-                cmd, plan_path = plan_seek_cmd(
-                    jepa, head, z_current, z_goal, sm,
-                    robot_xy, robot_yaw, seek_nav, gbody,
-                    navdist, herr, args.cands, args.horizon, dev, prev_cmd,
-                )
-            else:
-                cmd, plan_path = plan_explore_cmd(
-                    jepa, head, z_current, z_explore, sm,
-                    robot_xy, robot_yaw, seek_nav, prev_cmd,
-                    args.cands, args.horizon, dev,
-                )
-            prev_cmd = cmd.clone()
+            if use_seek_planner is not None:
+                navvec  = seek_nav - robot_xy
+                navdist = float(np.linalg.norm(navvec))
+                navdir  = navvec / max(navdist, 1e-8)
+                gbody   = world_to_body_xy(robot_yaw, navdir)
+                gang    = math.atan2(float(navvec[1]), float(navvec[0]))
+                herr    = wrap_to_pi(gang - robot_yaw)
+                if use_seek_planner:
+                    cmd, plan_path = plan_seek_cmd(
+                        jepa, head, z_current, z_goal, sm,
+                        robot_xy, robot_yaw, seek_nav, gbody,
+                        navdist, herr, args.cands, args.horizon, dev, prev_cmd,
+                    )
+                else:
+                    cmd, plan_path = plan_explore_cmd(
+                        jepa, head, z_current, z_explore, sm,
+                        robot_xy, robot_yaw, seek_nav, prev_cmd,
+                        args.cands, args.horizon, dev,
+                    )
+                prev_cmd = cmd.clone()
         else:
             # Frontier exploration.
             frontier_age += 1
