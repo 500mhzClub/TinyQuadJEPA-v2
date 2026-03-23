@@ -82,9 +82,9 @@ DETECT_DIST  = 2.2   # metres
 DETECT_FOV   = 0.90  # radians half-angle (~52°)
 ARRIVE_DIST  = 0.45  # metres — waypoint claimed
 MAX_SEEK_STEPS = 400
-DETECT_ENERGY_THRESH  = 0.95
-DETECT_ENERGY_MARGIN  = 0.18
-DETECT_CONFIRM_STEPS  = 4
+DETECT_ENERGY_THRESH  = -0.35
+DETECT_ENERGY_MARGIN  = 0.35
+DETECT_CONFIRM_STEPS  = 5
 
 # ── Perceptual OCC parameters ──────────────────────────────────────────── #
 OCC_VOTE_THRESH = 4     # hits needed before a cell is promoted to MAP_OCC
@@ -689,6 +689,49 @@ def find_far_unknown(sm, robot_xy, min_dist=0.35):
                 best_d = d
                 best_wp = wp
     return best_wp if best_d >= min_dist else robot_xy.copy()
+
+
+def select_goal_proxy(sm, robot_xy, goal_xy, blacklist=None, bl_radius=0.35):
+    """Reachable free-space proxy that moves the robot toward an occluded goal."""
+    bl = blacklist or []
+    best_wp = None
+    best_score = float("-inf")
+    goal_dist0 = float(np.linalg.norm(goal_xy - robot_xy))
+
+    for r in range(1, sm.h - 1):
+        for c in range(1, sm.w - 1):
+            if sm.grid[r, c] != MAP_FREE:
+                continue
+            wp = grid_to_world(sm, (r, c))
+            if any(float(np.linalg.norm(wp - bp)) < bl_radius for bp in bl):
+                continue
+            dist_robot = float(np.linalg.norm(wp - robot_xy))
+            if dist_robot < 0.20:
+                continue
+            if not _frontier_reachable(sm, robot_xy, wp):
+                continue
+
+            dist_goal = float(np.linalg.norm(goal_xy - wp))
+            progress = goal_dist0 - dist_goal
+            unk = sum(
+                1 for rr in range(r - 1, r + 2) for cc in range(c - 1, c + 2)
+                if not (rr == r and cc == c) and sm.grid[rr, cc] == MAP_UNKNOWN
+            )
+            occ = sum(
+                1 for rr in range(r - 1, r + 2) for cc in range(c - 1, c + 2)
+                if not (rr == r and cc == c) and sm.grid[rr, cc] == MAP_OCC
+            )
+            score = (
+                1.35 * progress
+                + 0.22 * float(unk)
+                - 0.20 * dist_robot
+                - 0.30 * float(occ)
+            )
+            if score > best_score:
+                best_score = score
+                best_wp = wp
+
+    return best_wp
 
 
 # --------------------------------------------------------------------------- #
@@ -1365,6 +1408,7 @@ def main():
         if detected is not None and seeking_idx < 0:
             detect_wp = waypoints[detected]
             seek_goal_xy = waypoint_seek_anchor(detect_wp)
+            proxy_goal_xy = select_goal_proxy(sm, robot_xy, seek_goal_xy, frontier_bl)
             route_ready = (
                 _frontier_reachable(sm, robot_xy, seek_goal_xy)
                 or bfs_next_waypoint(sm, robot_xy, seek_goal_xy,
@@ -1390,7 +1434,7 @@ def main():
                     f"step {step:4d}  SPOTTED {detect_wp.name}  d={dist_spotted:.1f}m  E={detect_e:.2f}",
                 ))
             else:
-                frontier_xy = seek_goal_xy.astype(np.float32)
+                frontier_xy = (proxy_goal_xy if proxy_goal_xy is not None else seek_goal_xy).astype(np.float32)
                 frontier_age = 0
                 cov_start = cov
                 seek_timeout_cd[detected] = max(seek_timeout_cd[detected], 30)
@@ -1538,13 +1582,19 @@ def main():
             seek_goal_xy = waypoint_seek_anchor(wp)
             gvec  = seek_goal_xy - robot_xy
             gdist = float(np.linalg.norm(gvec))
+            use_seek_planner = True
 
             if not _frontier_reachable(sm, robot_xy, seek_goal_xy):
                 bfs_tgt  = bfs_next_waypoint(
                     sm, robot_xy, seek_goal_xy,
                     lookahead_m=0.7, allow_unknown=False,
                 )
-                seek_nav = bfs_tgt if bfs_tgt is not None else seek_goal_xy
+                if bfs_tgt is not None:
+                    seek_nav = bfs_tgt
+                else:
+                    proxy_tgt = select_goal_proxy(sm, robot_xy, seek_goal_xy, frontier_bl)
+                    seek_nav = proxy_tgt if proxy_tgt is not None else seek_goal_xy
+                    use_seek_planner = False
             else:
                 seek_nav = seek_goal_xy
 
@@ -1554,11 +1604,18 @@ def main():
             gbody   = world_to_body_xy(robot_yaw, navdir)
             gang    = math.atan2(float(navvec[1]), float(navvec[0]))
             herr    = wrap_to_pi(gang - robot_yaw)
-            cmd, plan_path = plan_seek_cmd(
-                jepa, head, z_current, z_goal, sm,
-                robot_xy, robot_yaw, seek_nav, gbody,
-                navdist, herr, args.cands, args.horizon, dev, prev_cmd,
-            )
+            if use_seek_planner:
+                cmd, plan_path = plan_seek_cmd(
+                    jepa, head, z_current, z_goal, sm,
+                    robot_xy, robot_yaw, seek_nav, gbody,
+                    navdist, herr, args.cands, args.horizon, dev, prev_cmd,
+                )
+            else:
+                cmd, plan_path = plan_explore_cmd(
+                    jepa, head, z_current, z_explore, sm,
+                    robot_xy, robot_yaw, seek_nav, prev_cmd,
+                    args.cands, args.horizon, dev,
+                )
             prev_cmd = cmd.clone()
         else:
             # Frontier exploration.
