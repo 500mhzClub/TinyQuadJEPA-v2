@@ -117,6 +117,8 @@ FRONT_STOP_DIST        = 0.28
 FRONT_BLOCKED_FRAC     = 0.35
 FRONT_MAP_CONFIRM_DIST = 0.40
 FRONT_MAP_SAMPLE_RADIUS = 0.05
+FRONT_GUARD_CENTER_LO  = 0.42
+FRONT_GUARD_CENTER_HI  = 0.58
 SEEK_ANCHOR_OFFSET     = 0.35
 SEEK_STALL_WINDOW      = 14
 SEEK_STALL_DISP        = 0.05
@@ -545,6 +547,30 @@ def depth_guard_stats(depth_img, depth_max, cam_pitch_rad=None, cam_height_m=Non
     }
 
 
+def front_depth_guard_stats(depth_img, depth_max, cam_pitch_rad=None, cam_height_m=None,
+                            fov_deg=BRAIN_CAM_FOV_DEG):
+    d = normalize_depth_image(depth_img, depth_max)
+    if d is None:
+        return None
+    h, w = d.shape
+    row_lo, row_hi = floor_safe_row_bounds(
+        h, 0.10, 0.70, depth_max,
+        cam_pitch_rad=cam_pitch_rad,
+        cam_height_m=cam_height_m,
+        fov_deg=fov_deg,
+        floor_margin_frac=DEPTH_GUARD_FLOOR_MARGIN_FRAC,
+    )
+    c0 = max(0, int(FRONT_GUARD_CENTER_LO * w))
+    c1 = min(w, max(c0 + 1, int(FRONT_GUARD_CENTER_HI * w)))
+    center = d[row_lo:row_hi, c0:c1]
+    if not center.size:
+        return None
+    return {
+        "center_q35": float(np.nanpercentile(center, 35)),
+        "center_close_frac": float(np.mean(center < FRONT_STOP_DIST)),
+    }
+
+
 def depth_view_signature(depth_img, depth_max, cam_pitch_rad=None, cam_height_m=None,
                          fov_deg=BRAIN_CAM_FOV_DEG):
     stats = depth_guard_stats(
@@ -563,7 +589,7 @@ def depth_view_signature(depth_img, depth_max, cam_pitch_rad=None, cam_height_m=
 
 def front_blocked_from_depth(depth_img, depth_max, cam_pitch_rad=None, cam_height_m=None,
                              fov_deg=BRAIN_CAM_FOV_DEG) -> bool:
-    stats = depth_guard_stats(
+    stats = front_depth_guard_stats(
         depth_img, depth_max,
         cam_pitch_rad=cam_pitch_rad,
         cam_height_m=cam_height_m,
@@ -1217,93 +1243,37 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
 
     goal_dir_body = world_to_body_xy(robot_yaw, goal_vec / max(goal_dist, 1e-8))
     hdg_err = wrap_to_pi(math.atan2(float(goal_vec[1]), float(goal_vec[0])) - robot_yaw)
-    far = goal_dist > 0.8
     front_align = max(0.0, float(goal_dir_body[0]))
-    side_need = min(1.0, abs(float(goal_dir_body[1])))
-    ts  = (0.30 if far else 0.20) * float(np.clip(goal_dist / 0.9, 0.25, 1.0))
-    if abs(hdg_err) > 0.65: ts *= 0.40
+    side_err = float(goal_dir_body[1])
+    vx = 0.10 + 0.24 * front_align + 0.06 * float(np.clip(goal_dist, 0.0, 1.0))
+    vy = 0.10 * side_err
+    wz = 1.10 * hdg_err
 
-    if abs(hdg_err) > math.pi * 0.55:
-        mean = torch.tensor([0.0, 0.0, math.copysign(0.72, hdg_err)],
-                            device=dev, dtype=torch.float32)
-        std  = torch.tensor([0.05, 0.03, 0.14], device=dev, dtype=torch.float32)
-    else:
-        mean = torch.tensor([
-            clamp(ts, 0.0, 0.40),
-            0.0,
-            clamp(0.65 * hdg_err, -0.72, 0.72),
-        ], device=dev, dtype=torch.float32)
-        std = torch.tensor([
-            0.13 if far else 0.09,
-            (0.04 if far else 0.03) + 0.05 * side_need,
-            0.24 if far else 0.18,
-        ], device=dev, dtype=torch.float32)
+    if abs(hdg_err) > 1.00:
+        vx *= 0.18
+        vy *= 0.25
+    elif abs(hdg_err) > 0.65:
+        vx *= 0.45
+        vy *= 0.60
 
-    best_cmd     = mean.view(1, 3)
-    best_cost    = None
-    best_path_np = None
-    frontier_t   = torch.tensor(frontier_xy, device=dev, dtype=torch.float32)
-    grid_t       = torch.as_tensor(sm.grid, device=dev)
-    occ_grid     = grid_t == MAP_OCC
-    unknown_grid = grid_t == MAP_UNKNOWN
-    # How well the robot is currently facing the frontier (0=sideways, 1=head-on).
-    # Used to scale the turn penalty and forward bonus: when already pointing at
-    # the goal, spinning should be expensive and going straight should pay off.
-    hdg_align = max(0.0, math.cos(hdg_err))
-    lat_lim = 0.08 + 0.10 * side_need
-    novelty_steps = {
-        max(0, hz // 3 - 1),
-        max(0, (2 * hz) // 3 - 1),
-        hz - 1,
-    }
+    if goal_dist < 0.45:
+        vx *= 0.65
+        vy *= 0.60
 
-    for _ in range(4):
-        cmds = mean + std * torch.randn((cands, 3), device=dev)
-        cmds[:, 0].clamp_(-0.08, 0.40)
-        cmds[:, 1].clamp_(-lat_lim, lat_lim)
-        cmds[:, 2].clamp_(-0.70, 0.70)
+    cmd = torch.tensor([[
+        clamp(vx, 0.04 if abs(hdg_err) < 0.90 else 0.0, 0.34),
+        clamp(vy, -0.08, 0.08),
+        clamp(wz, -0.70, 0.70),
+    ]], device=dev, dtype=torch.float32)
 
-        z_roll = zc.expand(cands, -1)
-        h_t    = torch.zeros((cands, jepa.latent_dim), device=dev, dtype=z_roll.dtype)
-        novelty_terms = []
-        for t in range(hz):
-            z_roll, h_t = jepa.predictor(z_roll, cmds, h_t)
-            if t in novelty_steps:
-                novelty_terms.append(latent_bank_novelty_torch(z_roll, latent_memory_norm))
-        novelty_t = (torch.stack(novelty_terms, dim=1).mean(dim=1)
-                     if novelty_terms else torch.ones(cands, device=dev, dtype=zc.dtype))
+    if prev_cmd is not None:
+        cmd = 0.75 * cmd + 0.25 * prev_cmd
+        cmd[:, 0].clamp_(0.0, 0.34)
+        cmd[:, 1].clamp_(-0.08, 0.08)
+        cmd[:, 2].clamp_(-0.70, 0.70)
 
-        paths_t, end_xy_t = rollout_cmds_batched_paths(robot_xy, robot_yaw, cmds, hz)
-        prog_t   = goal_dist - (end_xy_t - frontier_t).norm(dim=1)
-        front_t  = local_unknown_gain_batched_torch(sm, end_xy_t, unknown_grid)
-        coll_t   = path_collision_penalty_batched_torch(sm, paths_t, occ_grid)
-
-        smooth = (torch.zeros(cands, device=dev) if prev_cmd is None
-                  else 0.10 * (cmds - prev_cmd).pow(2).sum(dim=-1))
-
-        cost = (coll_t
-                + smooth
-                + (0.80 + 0.45 * front_align) * cmds[:, 1].abs()
-                + (0.10 + 0.28 * hdg_align) * cmds[:, 2].abs()
-                + 0.25 * (-cmds[:, 0]).clamp_min(0.0)
-                + (cmds[:, 0] < 0.02).float() * (0.20 + 0.10 * front_align)
-                - 2.40 * prog_t
-                - 0.90 * front_t
-                - LATENT_NOVELTY_WEIGHT * novelty_t
-                - (0.28 + 0.48 * hdg_align) * cmds[:, 0].clamp_min(0.0))
-
-        k = max(8, cands // 10)
-        elite = torch.topk(cost, k=k, largest=False).indices
-        mean  = cmds[elite].mean(0)
-        std   = cmds[elite].std(0) + 1e-4
-
-        ib = int(torch.argmin(cost).item())
-        if best_cost is None or float(cost[ib]) < best_cost:
-            best_cost    = float(cost[ib])
-            best_cmd     = cmds[ib].detach().clone().view(1, 3)
-            best_path_np = paths_t[ib].detach().cpu().numpy()
-
-    return best_cmd, best_path_np if best_path_np is not None else np.zeros((hz, 2), np.float32)
+    path_t, _ = rollout_cmds_batched_paths(robot_xy, robot_yaw, cmd, hz)
+    return cmd, path_t[0].detach().cpu().numpy()
 
 
 # --------------------------------------------------------------------------- #
@@ -2050,7 +2020,7 @@ def main():
         # ── Perception safety filter (seek + explore) ─────────────────── #
         if guard_steps <= 0 and clip_retreat_steps <= 0:
             left_vec = np.array([-math.sin(robot_yaw),  math.cos(robot_yaw)], np.float32)
-            depth_stats = depth_guard_stats(
+            depth_stats = front_depth_guard_stats(
                 depth, args.depth_max,
                 cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
                 fov_deg=BRAIN_CAM_FOV_DEG,
