@@ -790,6 +790,30 @@ def path_collision_penalty_batched(sm, paths_np):
     return pen.reshape(N,hz).sum(axis=1)
 
 
+def path_collision_penalty_batched_torch(sm, paths_t, occ_grid=None):
+    N, hz, _ = paths_t.shape
+    if occ_grid is None:
+        occ_grid = torch.as_tensor(sm.grid == MAP_OCC, device=paths_t.device)
+    pts = paths_t.reshape(-1, 2)
+    gx = (((pts[:, 0] - float(WORLD_MIN[0])) / sm.res).long()).clamp_(0, sm.w - 1)
+    gy = (((pts[:, 1] - float(WORLD_MIN[1])) / sm.res).long()).clamp_(0, sm.h - 1)
+    pen = occ_grid[gy, gx].to(paths_t.dtype) * 2.8
+    orth_hits = torch.zeros_like(pen)
+    for dr, dc, w in (
+        (-1, 0, 0.28), (1, 0, 0.28), (0, -1, 0.28), (0, 1, 0.28),
+        (-1, -1, 0.20), (-1, 1, 0.20), (1, -1, 0.20), (1, 1, 0.20),
+        (-2, 0, 0.10), (2, 0, 0.10), (0, -2, 0.10), (0, 2, 0.10),
+    ):
+        gyn = (gy + dr).clamp_(0, sm.h - 1)
+        gxn = (gx + dc).clamp_(0, sm.w - 1)
+        hit = occ_grid[gyn, gxn].to(paths_t.dtype)
+        pen = pen + hit * w
+        if abs(dr) + abs(dc) == 1:
+            orth_hits = orth_hits + hit
+    pen = pen + (orth_hits >= 2).to(paths_t.dtype) * 0.75
+    return pen.view(N, hz).sum(dim=1)
+
+
 def local_unknown_gain_batched(sm, end_xy, radius=0.55):
     N = end_xy.shape[0]
     gx0 = ((end_xy[:,0]-float(WORLD_MIN[0]))/sm.res).astype(np.int32)
@@ -805,6 +829,28 @@ def local_unknown_gain_batched(sm, end_xy, radius=0.55):
             in_r = np.sqrt((px-end_xy[:,0])**2+(py-end_xy[:,1])**2)<=radius
             gyn_c = np.clip(gyn,0,sm.h-1); gxn_c = np.clip(gxn,0,sm.w-1)
             counts += (valid & in_r & (sm.grid[gyn_c,gxn_c]==MAP_UNKNOWN)).astype(np.float32)
+    return counts * 0.08
+
+
+def local_unknown_gain_batched_torch(sm, end_xy_t, unknown_grid=None, radius=0.55):
+    N = int(end_xy_t.shape[0])
+    if unknown_grid is None:
+        unknown_grid = torch.as_tensor(sm.grid == MAP_UNKNOWN, device=end_xy_t.device)
+    gx0 = (((end_xy_t[:, 0] - float(WORLD_MIN[0])) / sm.res).long())
+    gy0 = (((end_xy_t[:, 1] - float(WORLD_MIN[1])) / sm.res).long())
+    rr = max(1, int(radius / sm.res))
+    counts = torch.zeros(N, device=end_xy_t.device, dtype=end_xy_t.dtype)
+    for dr in range(-rr, rr + 1):
+        for dc in range(-rr, rr + 1):
+            gyn = gy0 + dr
+            gxn = gx0 + dc
+            valid = (gyn >= 0) & (gyn < sm.h) & (gxn >= 0) & (gxn < sm.w)
+            gyn_c = gyn.clamp(0, sm.h - 1)
+            gxn_c = gxn.clamp(0, sm.w - 1)
+            px = float(WORLD_MIN[0]) + (gxn_c.to(end_xy_t.dtype) + 0.5) * sm.res
+            py = float(WORLD_MIN[1]) + (gyn_c.to(end_xy_t.dtype) + 0.5) * sm.res
+            in_r = torch.sqrt((px - end_xy_t[:, 0]) ** 2 + (py - end_xy_t[:, 1]) ** 2) <= radius
+            counts = counts + (valid & in_r & unknown_grid[gyn_c, gxn_c]).to(end_xy_t.dtype)
     return counts * 0.08
 
 
@@ -924,6 +970,8 @@ def plan_seek_cmd(
     best_cost = None
     best_path = None
     energy_weight = float(np.clip((dist_to_goal-0.35)/0.65, 0.0, 1.0))
+    goal_t = torch.tensor(goal_xy, device=dev, dtype=torch.float32)
+    occ_grid = torch.as_tensor(sm.grid == MAP_OCC, device=dev)
 
     for _ in range(5):
         cmds = mean + std * torch.randn((n_candidates,3), device=dev)
@@ -938,10 +986,9 @@ def plan_seek_cmd(
 
         eng = head(z_roll, z_goal.expand_as(z_roll))
 
-        goal_t    = torch.tensor(goal_xy, device=dev, dtype=torch.float32)
         paths_t, end_xy_t = rollout_cmds_batched_paths(robot_xy, robot_yaw, cmds, horizon)
         _, end_yaw_t      = rollout_cmds_batched(robot_xy, robot_yaw, cmds, horizon)
-        coll_np    = path_collision_penalty_batched(sm, paths_t.cpu().numpy())
+        coll_t     = path_collision_penalty_batched_torch(sm, paths_t, occ_grid)
         end_dist_t = (end_xy_t - goal_t).norm(dim=1)
         end_ang_t  = torch.atan2(goal_t[1]-end_xy_t[:,1], goal_t[0]-end_xy_t[:,0])
         end_herr_t = ((end_ang_t - end_yaw_t + math.pi) % (2*math.pi) - math.pi).abs()
@@ -950,7 +997,7 @@ def plan_seek_cmd(
         cost = (
             energy_weight * eng
             + geo_cost
-            + torch.from_numpy(coll_np).to(dev)
+            + coll_t
             + 0.45 * cmds[:, 1].abs()
             + 0.06 * cmds[:, 2].abs()
         )
@@ -966,8 +1013,7 @@ def plan_seek_cmd(
         if best_cost is None or float(cost[ib]) < best_cost:
             best_cost = float(cost[ib])
             best_cmd  = cmds[ib].view(1,3).detach().clone()
-            best_path, _, _ = _kin_path(robot_xy, robot_yaw,
-                                        cmds[ib].cpu().numpy(), horizon)
+            best_path = paths_t[ib].detach().cpu().numpy()
 
     return best_cmd, best_path if best_path is not None else np.zeros((horizon,2), np.float32)
 
@@ -1018,6 +1064,10 @@ def plan_explore_cmd(jepa, head, zc, z_explore, sm, robot_xy, robot_yaw, frontie
     best_cmd     = mean.view(1, 3)
     best_cost    = None
     best_path_np = None
+    frontier_t   = torch.tensor(frontier_xy, device=dev, dtype=torch.float32)
+    grid_t       = torch.as_tensor(sm.grid, device=dev)
+    occ_grid     = grid_t == MAP_OCC
+    unknown_grid = grid_t == MAP_UNKNOWN
 
     for _ in range(4):
         cmds = mean + std * torch.randn((cands, 3), device=dev)
@@ -1033,23 +1083,20 @@ def plan_explore_cmd(jepa, head, zc, z_explore, sm, robot_xy, robot_yaw, frontie
         ebm_cost = head(z_roll, z_explore.expand_as(z_roll)) * 0.35
 
         paths_t, end_xy_t = rollout_cmds_batched_paths(robot_xy, robot_yaw, cmds, hz)
-        paths_np = paths_t.cpu().numpy()
-        end_np   = end_xy_t.cpu().numpy()
-
-        prog_np  = (goal_dist - np.linalg.norm(end_np - frontier_xy, axis=1)).astype(np.float32)
-        front_np = local_unknown_gain_batched(sm, end_np)
-        coll_np  = path_collision_penalty_batched(sm, paths_np)
+        prog_t   = goal_dist - (end_xy_t - frontier_t).norm(dim=1)
+        front_t  = local_unknown_gain_batched_torch(sm, end_xy_t, unknown_grid)
+        coll_t   = path_collision_penalty_batched_torch(sm, paths_t, occ_grid)
 
         smooth = (torch.zeros(cands, device=dev) if prev_cmd is None
                   else 0.10 * (cmds - prev_cmd).pow(2).sum(dim=-1))
 
-        cost = (torch.from_numpy(coll_np).to(dev)
+        cost = (coll_t
                 + ebm_cost
                 + smooth
                 + 0.50 * cmds[:, 1].abs()
                 + (cmds[:, 0] < 0.02).float() * 0.10
-                - 3.0 * torch.from_numpy(prog_np).to(dev)
-                - 0.80 * torch.from_numpy(front_np).to(dev))
+                - 3.0 * prog_t
+                - 0.80 * front_t)
 
         k = max(8, cands // 10)
         elite = torch.topk(cost, k=k, largest=False).indices
@@ -1060,7 +1107,7 @@ def plan_explore_cmd(jepa, head, zc, z_explore, sm, robot_xy, robot_yaw, frontie
         if best_cost is None or float(cost[ib]) < best_cost:
             best_cost    = float(cost[ib])
             best_cmd     = cmds[ib].detach().clone().view(1, 3)
-            best_path_np = paths_np[ib]
+            best_path_np = paths_t[ib].detach().cpu().numpy()
 
     return best_cmd, best_path_np if best_path_np is not None else np.zeros((hz, 2), np.float32)
 
