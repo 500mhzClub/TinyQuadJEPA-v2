@@ -70,10 +70,16 @@ def init_genesis_once(sim_backend_arg: str = "auto", logging_level=None) -> None
 
 
 def to_genesis_target(x: torch.Tensor) -> torch.Tensor:
-    """Detach, move to CPU numpy, then re-wrap for Genesis device."""
+    """Move a tensor onto the active Genesis device with a safe fallback."""
     import genesis as gs  # noqa: delay import
-    x_np = x.detach().to("cpu").numpy().astype(np.float32, copy=True)
-    return torch.tensor(x_np, device=gs.device, dtype=torch.float32)
+    x_det = x.detach()
+    try:
+        x_gs = x_det.to(device=gs.device, dtype=torch.float32)
+        return x_gs if x_gs.is_contiguous() else x_gs.contiguous()
+    except Exception:
+        # Some Genesis backends are happier with a CPU numpy handoff.
+        x_np = x_det.to("cpu").numpy().astype(np.float32, copy=True)
+        return torch.tensor(x_np, device=gs.device, dtype=torch.float32)
 
 
 def to_numpy(x) -> np.ndarray | None:
