@@ -461,10 +461,10 @@ def normalize_depth_image(depth_img, depth_max):
     mx, mn = float(np.nanmax(d)), float(np.nanmin(d))
     d = np.clip(d, 0, 1) * depth_max if mx <= 1.05 and mn >= 0 else np.clip(d, 0, depth_max)
     d = np.nan_to_num(d, nan=depth_max, posinf=depth_max).astype(np.float32)
-    # Genesis/Vulkan reverse-Z: 0.0 = no geometry (sky / beyond range).
-    # Also catches body/feet returns inside MIN_OCC_DEPTH.
-    # Treat all sub-threshold readings as "no valid hit" = depth_max.
-    d[d < MIN_OCC_DEPTH] = depth_max
+    # Genesis/Vulkan reverse-Z: 0.0 means "no geometry" (sky / beyond range).
+    # Only filter these near-zero no-hit pixels; keep real close-range wall
+    # returns so that front_blocked_from_depth can detect them correctly.
+    d[d < 0.02] = depth_max
     return d
 
 
@@ -1879,8 +1879,8 @@ def main():
                 frontier_switches += 1
                 frontier_xy = new_f; frontier_age = 0; cov_start = cov
 
-            if not _frontier_reachable(sm, robot_xy, frontier_xy, allow_unknown=True):
-                bfs_wp = bfs_next_waypoint(sm, robot_xy, frontier_xy, allow_unknown=True)
+            if not _frontier_reachable(sm, robot_xy, frontier_xy):
+                bfs_wp = bfs_next_waypoint(sm, robot_xy, frontier_xy)
                 nav_target = bfs_wp if bfs_wp is not None else frontier_xy
             else:
                 nav_target = frontier_xy
