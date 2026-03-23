@@ -115,6 +115,8 @@ DEPTH_GUARD_FLOOR_MARGIN_FRAC = 0.03
 
 FRONT_STOP_DIST        = 0.28
 FRONT_BLOCKED_FRAC     = 0.35
+FRONT_MAP_CONFIRM_DIST = 0.40
+FRONT_MAP_SAMPLE_RADIUS = 0.05
 SEEK_ANCHOR_OFFSET     = 0.35
 SEEK_STALL_WINDOW      = 14
 SEEK_STALL_DISP        = 0.05
@@ -429,6 +431,16 @@ def sample_occ_with_clearance(sm, xy, radius=ROBOT_CLEARANCE_RADIUS) -> bool:
             if float(np.linalg.norm(p - xy[:2])) <= radius and sm.grid[r, c] == MAP_OCC:
                 return True
     return False
+
+
+def sample_front_occ_hits(sm, robot_xy, robot_yaw,
+                          dists=(0.10, 0.16, 0.22, 0.30),
+                          radius=FRONT_MAP_SAMPLE_RADIUS):
+    fwd = np.array([math.cos(robot_yaw), math.sin(robot_yaw)], np.float32)
+    return [
+        sample_occ_with_clearance(sm, robot_xy + float(dist) * fwd, radius=radius)
+        for dist in dists
+    ]
 
 
 def sample_traversable_with_clearance(sm, xy, radius=ROBOT_CLEARANCE_RADIUS, allow_unknown=False) -> bool:
@@ -1203,8 +1215,11 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
         nudge = torch.tensor([[0.16, 0.0, 0.45]], device=dev, dtype=torch.float32)
         return nudge, np.zeros((hz, 2), np.float32)
 
+    goal_dir_body = world_to_body_xy(robot_yaw, goal_vec / max(goal_dist, 1e-8))
     hdg_err = wrap_to_pi(math.atan2(float(goal_vec[1]), float(goal_vec[0])) - robot_yaw)
     far = goal_dist > 0.8
+    front_align = max(0.0, float(goal_dir_body[0]))
+    side_need = min(1.0, abs(float(goal_dir_body[1])))
     ts  = (0.30 if far else 0.20) * float(np.clip(goal_dist / 0.9, 0.25, 1.0))
     if abs(hdg_err) > 0.65: ts *= 0.40
 
@@ -1220,7 +1235,7 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
         ], device=dev, dtype=torch.float32)
         std = torch.tensor([
             0.13 if far else 0.09,
-            0.08 if far else 0.06,
+            (0.04 if far else 0.03) + 0.05 * side_need,
             0.24 if far else 0.18,
         ], device=dev, dtype=torch.float32)
 
@@ -1235,6 +1250,7 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
     # Used to scale the turn penalty and forward bonus: when already pointing at
     # the goal, spinning should be expensive and going straight should pay off.
     hdg_align = max(0.0, math.cos(hdg_err))
+    lat_lim = 0.08 + 0.10 * side_need
     novelty_steps = {
         max(0, hz // 3 - 1),
         max(0, (2 * hz) // 3 - 1),
@@ -1244,7 +1260,7 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
     for _ in range(4):
         cmds = mean + std * torch.randn((cands, 3), device=dev)
         cmds[:, 0].clamp_(-0.08, 0.40)
-        cmds[:, 1].clamp_(-0.20, 0.20)
+        cmds[:, 1].clamp_(-lat_lim, lat_lim)
         cmds[:, 2].clamp_(-0.70, 0.70)
 
         z_roll = zc.expand(cands, -1)
@@ -1267,14 +1283,14 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
 
         cost = (coll_t
                 + smooth
-                + 0.50 * cmds[:, 1].abs()
+                + (0.80 + 0.45 * front_align) * cmds[:, 1].abs()
                 + (0.10 + 0.28 * hdg_align) * cmds[:, 2].abs()
                 + 0.25 * (-cmds[:, 0]).clamp_min(0.0)
-                + (cmds[:, 0] < 0.02).float() * 0.20
+                + (cmds[:, 0] < 0.02).float() * (0.20 + 0.10 * front_align)
                 - 2.40 * prog_t
                 - 0.90 * front_t
                 - LATENT_NOVELTY_WEIGHT * novelty_t
-                - (0.20 + 0.38 * hdg_align) * cmds[:, 0].clamp_min(0.0))
+                - (0.28 + 0.48 * hdg_align) * cmds[:, 0].clamp_min(0.0))
 
         k = max(8, cands // 10)
         elite = torch.topk(cost, k=k, largest=False).indices
@@ -2033,14 +2049,28 @@ def main():
 
         # ── Perception safety filter (seek + explore) ─────────────────── #
         if guard_steps <= 0 and clip_retreat_steps <= 0:
-            fwd_vec = np.array([math.cos(robot_yaw), math.sin(robot_yaw)], np.float32)
             left_vec = np.array([-math.sin(robot_yaw),  math.cos(robot_yaw)], np.float32)
-            occ_count = sum(1 for d in (0.12, 0.20, 0.30)
-                           if sample_occ_with_clearance(sm, robot_xy + d * fwd_vec, radius=0.06))
-            depth_blocked = front_blocked_from_depth(
+            depth_stats = depth_guard_stats(
                 depth, args.depth_max,
                 cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
                 fov_deg=BRAIN_CAM_FOV_DEG,
+            )
+            depth_blocked = (
+                depth_stats is not None
+                and (
+                    depth_stats["center_q35"] < FRONT_STOP_DIST
+                    or depth_stats["center_close_frac"] > FRONT_BLOCKED_FRAC
+                )
+            )
+            depth_clearance = (
+                args.depth_max if depth_stats is None
+                else float(depth_stats["center_q35"])
+            )
+            occ_hits = sample_front_occ_hits(sm, robot_xy, robot_yaw)
+            occ_near = int(occ_hits[0]) + int(occ_hits[1])
+            map_immediate_blocked = (
+                occ_near >= 2
+                and (depth_stats is None or depth_clearance < FRONT_MAP_CONFIRM_DIST)
             )
             left_occ = sample_occ_with_clearance(sm, robot_xy + 0.14 * left_vec, radius=0.08)
             right_occ = sample_occ_with_clearance(sm, robot_xy - 0.14 * left_vec, radius=0.08)
@@ -2058,7 +2088,7 @@ def main():
                 prev_cmd = cmd.clone()
                 plan_path = None
 
-            if float(cmd[0, 0].item()) > 0.02 and (occ_count >= 2 or depth_blocked):
+            if float(cmd[0, 0].item()) > 0.02 and (depth_blocked or map_immediate_blocked):
                 if depth_blocked:
                     reinforce_front_obstacle(
                         sm, robot_xy, robot_yaw, depth, args.depth_max,
