@@ -947,8 +947,9 @@ def draw_minimap(draw, sm, robot_xy, robot_yaw, target_xy, trail, plan_path,
 
     for r in range(sm.h):
         for c in range(sm.w):
-            x0 = mx+int(c/sm.w*mw); y0 = my+int(r/sm.h*mh)
-            x1 = mx+int((c+1)/sm.w*mw); y1 = my+int((r+1)/sm.h*mh)
+            # Flip rows so world y_min (row 0) is at the bottom, matching _wp_to_map.
+            x0 = mx+int(c/sm.w*mw);       y0 = my+mh-int((r+1)/sm.h*mh)
+            x1 = mx+int((c+1)/sm.w*mw);   y1 = my+mh-int(r/sm.h*mh)
             v = int(sm.grid[r,c])
             fill = (48,48,48) if v==MAP_FREE else (180,70,70) if v==MAP_OCC else (25,25,25)
             draw.rectangle([x0,y0,x1,y1], fill=fill)
