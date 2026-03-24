@@ -87,12 +87,18 @@ DETECT_CONFIRM_STEPS  = 5
 GLIMPSE_ENERGY_THRESH = -0.55
 GLIMPSE_ENERGY_MARGIN = 0.15
 GLIMPSE_CONFIRM_STEPS = 2
+LATENT_SUPPORT_DELTA  = 0.45
+DETECT_SUPPORT_MIN    = 2
+CLAIM_SUPPORT_MIN     = 2
 DETECT_STRIDE         = 4
 BREADCRUMB_YAW_OFFSETS_DEG = (-90.0, -55.0, -28.0, -12.0, 0.0, 12.0, 28.0, 55.0, 90.0)
 REFERENCE_PANEL_X = 1.25
 REFERENCE_PANEL_SPACING = 1.60
+CLAIM_FRONT_DEPTH_MIN = 0.25
 CLAIM_FRONT_DEPTH = 0.65
 CLAIM_ENERGY_MARGIN = 0.20
+CLAIM_BEACON_WEIGHT = 0.85
+CLAIM_CONFIRM_STEPS = 4
 LATENT_MEMORY_MAX = 512
 LATENT_MEMORY_STRIDE = 4
 LATENT_MEMORY_MIN_STEP_DIST = 0.10
@@ -126,6 +132,8 @@ SEEK_STALL_DISP        = 0.05
 SEEK_STALL_PROGRESS    = 0.10
 SEEK_RECOVERY_COOLDOWN = 30
 SEEK_PROGRESS_RESET    = 0.20
+TRACK_MIN_WEIGHT       = 0.12
+TRACK_LOST_STEPS       = 40
 LINE_CHECK_STEP_M      = 0.05
 LONG_STALL_WINDOW = 220
 LONG_STALL_RADIUS = 0.18
@@ -1395,27 +1403,45 @@ def harvest_explore_reference(
 def score_beacon_matches(z_current, head, bc_lats):
     best_energy: List[float] = []
     best_latent_idx: List[int] = []
+    support_counts: List[int] = []
     for z_goals in bc_lats:
         zc = z_current.expand(z_goals.shape[0], -1)
         e_all = head(zc, z_goals).view(-1)
         k = int(torch.argmin(e_all).item())
+        n = int(e_all.numel())
+        if n >= 3:
+            k_prev = (k - 1) % n
+            k_next = (k + 1) % n
+            local_e = (
+                0.50 * float(e_all[k].item())
+                + 0.25 * float(e_all[k_prev].item())
+                + 0.25 * float(e_all[k_next].item())
+            )
+        else:
+            local_e = float(e_all[k].item())
         best_latent_idx.append(k)
-        best_energy.append(float(e_all[k].item()))
-    return best_energy, best_latent_idx
+        best_energy.append(local_e)
+        support = int((e_all <= (e_all[k] + LATENT_SUPPORT_DELTA)).sum().item())
+        support_counts.append(support)
+    return best_energy, best_latent_idx, support_counts
 
 
 # --------------------------------------------------------------------------- #
 # Unified perceptual planner
 # --------------------------------------------------------------------------- #
 
-def compute_beacon_weight(raw_energy: float, second_best_energy: float) -> float:
-    if not math.isfinite(raw_energy):
+def compute_beacon_weight(raw_energy: float, second_best_energy: float, support_count: int) -> float:
+    if not math.isfinite(raw_energy) or support_count < DETECT_SUPPORT_MIN:
         return 0.0
     margin = max(0.0, float(second_best_energy - raw_energy))
     energy_span = max(GLIMPSE_ENERGY_THRESH - DETECT_ENERGY_THRESH, 1e-6)
     energy_term = float(np.clip((GLIMPSE_ENERGY_THRESH - raw_energy) / energy_span, 0.0, 1.5))
     margin_term = float(np.clip(margin / max(DETECT_ENERGY_MARGIN, 1e-6), 0.0, 1.5))
-    return float(np.clip(energy_term * (0.65 + 0.35 * margin_term), 0.0, 1.5))
+    support_term = float(np.clip((support_count - 1) / 2.0, 0.0, 1.0))
+    return float(np.clip(
+        energy_term * (0.65 + 0.35 * margin_term) * (0.60 + 0.40 * support_term),
+        0.0, 1.5,
+    ))
 
 
 @torch.no_grad()
@@ -1590,11 +1616,15 @@ def plan_perceptual_cmd(
 # --------------------------------------------------------------------------- #
 
 @torch.no_grad()
-def check_detections(match_energy, match_latent_idx, found, seeking_idx,
+def check_detections(match_energy, match_latent_idx, match_support, found, seeking_idx,
                      seek_timeout_cd, detect_streaks, glimpse_streaks):
     candidates: List[Tuple[int, float, int]] = []
     for i, e_min in enumerate(match_energy):
         if found[i] or i == seeking_idx or seek_timeout_cd[i] > 0:
+            detect_streaks[i] = 0
+            glimpse_streaks[i] = 0
+            continue
+        if int(match_support[i]) < DETECT_SUPPORT_MIN:
             detect_streaks[i] = 0
             glimpse_streaks[i] = 0
             continue
@@ -1868,6 +1898,8 @@ def main():
     seek_recent_sig:  Deque[np.ndarray] = deque(maxlen=SEEK_STALL_WINDOW)
     seek_recovery_cd = 0
     seek_stall_count = 0   # consecutive stalls without escaping
+    track_unsupported_steps = 0
+    claim_confirm_streak = 0
     seek_start_score = 0.0
     seek_best_score  = 0.0
     guard_trip_pos:   Deque[np.ndarray] = deque(maxlen=12)
@@ -1957,7 +1989,7 @@ def main():
                 last_memory_key = mem_key
 
         # ── Beacon latent matching ─────────────────────────────────────── #
-        match_energy, match_latent_idx = score_beacon_matches(z_current, head, bc_lats)
+        match_energy, match_latent_idx, match_support = score_beacon_matches(z_current, head, bc_lats)
         seek_timeout_cd = [max(0, c - 1) for c in seek_timeout_cd]
         detected = None
         detect_e = None
@@ -1966,7 +1998,7 @@ def main():
         if (seeking_idx < 0 and clip_retreat_steps <= 0
                 and step % DETECT_STRIDE == 0):
             detected, detect_e, detect_kind, detect_k = check_detections(
-                match_energy, match_latent_idx, found, seeking_idx,
+                match_energy, match_latent_idx, match_support, found, seeking_idx,
                 seek_timeout_cd, detect_streaks, glimpse_streaks,
             )
         if detected is not None and seeking_idx < 0:
@@ -1982,6 +2014,8 @@ def main():
             seek_recent_sig.clear()
             seek_recovery_cd = 0
             seek_stall_count = 0
+            track_unsupported_steps = 0
+            claim_confirm_streak = 0
             seek_start_score = detect_e
             seek_best_score  = detect_e
             long_stall_pos.clear(); long_stall_cov.clear(); long_stall_score.clear()
@@ -2054,6 +2088,8 @@ def main():
                         seek_timeout_cd[seeking_idx] = max(seek_timeout_cd[seeking_idx], 90)
                         seeking_idx = -1
                         seek_best_score = 0.0
+                        track_unsupported_steps = 0
+                        claim_confirm_streak = 0
                         seek_recent_pos.clear()
                         seek_recent_score.clear()
                         seek_recent_sig.clear()
@@ -2073,16 +2109,49 @@ def main():
         else:
             best_match_idx = -1
             second_best_e = float("inf")
+        current_support = int(match_support[seeking_idx]) if seeking_idx >= 0 else 0
         beacon_weight = (
-            compute_beacon_weight(raw_e, second_best_e)
+            compute_beacon_weight(raw_e, second_best_e, current_support)
             if seeking_idx >= 0 and best_match_idx == seeking_idx
             else 0.0
         )
+        if seeking_idx >= 0:
+            if beacon_weight > TRACK_MIN_WEIGHT:
+                track_unsupported_steps = 0
+            else:
+                track_unsupported_steps += 1
+                if track_unsupported_steps >= TRACK_LOST_STEPS:
+                    lost_idx = seeking_idx
+                    lost_wp = waypoints[lost_idx]
+                    print(f"\n  [TRACK-LOST] {lost_wp.name} at step {step}  support={current_support}  E={raw_e:.2f}")
+                    seek_timeout_cd[lost_idx] = max(seek_timeout_cd[lost_idx], 45)
+                    seeking_idx = -1
+                    prev_cmd = None
+                    seek_best_score = 0.0
+                    seek_recent_pos.clear()
+                    seek_recent_score.clear()
+                    seek_recent_sig.clear()
+                    seek_recovery_cd = 0
+                    seek_stall_count = 0
+                    claim_confirm_streak = 0
+                    continue
+        else:
+            track_unsupported_steps = 0
 
-        if (seeking_idx >= 0
-                and best_match_idx == seeking_idx
-                and front_depth <= CLAIM_FRONT_DEPTH
-                and second_best_e >= raw_e + CLAIM_ENERGY_MARGIN):
+        claim_ready = (
+            seeking_idx >= 0
+            and best_match_idx == seeking_idx
+            and current_support >= CLAIM_SUPPORT_MIN
+            and CLAIM_FRONT_DEPTH_MIN <= front_depth <= CLAIM_FRONT_DEPTH
+            and beacon_weight >= CLAIM_BEACON_WEIGHT
+            and second_best_e >= raw_e + CLAIM_ENERGY_MARGIN
+        )
+        if claim_ready:
+            claim_confirm_streak += 1
+        else:
+            claim_confirm_streak = 0
+
+        if claim_ready and claim_confirm_streak >= CLAIM_CONFIRM_STEPS:
             claimed_idx = seeking_idx
             wp = waypoints[claimed_idx]
             found[claimed_idx] = True
@@ -2097,6 +2166,8 @@ def main():
                                f"step {step:4d}  CLAIMED {wp.name}  ({n_found}/{len(waypoints)})"))
             seeking_idx = -1; prev_cmd = None
             seek_best_score = 0.0
+            track_unsupported_steps = 0
+            claim_confirm_streak = 0
             seek_recent_pos.clear()
             seek_recent_score.clear()
             seek_recent_sig.clear()
@@ -2134,6 +2205,8 @@ def main():
                 frontier_age = 0; cov_start = cov
                 seeking_idx = -1; prev_cmd = None
                 seek_best_score = 0.0
+                track_unsupported_steps = 0
+                claim_confirm_streak = 0
                 seek_recent_pos.clear()
                 seek_recent_score.clear()
                 seek_recent_sig.clear()
@@ -2195,6 +2268,8 @@ def main():
                     frontier_age = 0; cov_start = cov
                     seeking_idx = -1; prev_cmd = None
                     seek_best_score = 0.0
+                    track_unsupported_steps = 0
+                    claim_confirm_streak = 0
                     guard_steps = 0
                     seek_recent_pos.clear()
                     seek_recent_score.clear()
@@ -2409,6 +2484,8 @@ def main():
                         seek_timeout_cd[seeking_idx] = max(seek_timeout_cd[seeking_idx], 60)
                         seeking_idx = -1
                         seek_best_score = 0.0
+                        track_unsupported_steps = 0
+                        claim_confirm_streak = 0
                         seek_recent_pos.clear()
                         seek_recent_score.clear()
                         seek_recent_sig.clear()
@@ -2427,7 +2504,10 @@ def main():
             eye_rgb  = render_rgb(cam_eye)
             n_found  = sum(found)
             if seeking_idx >= 0:
-                mode_str = f"TRACK {waypoints[seeking_idx].name}  E={seek_ema_e:.2f}  w={beacon_weight:.2f}"
+                mode_str = (
+                    f"TRACK {waypoints[seeking_idx].name}  "
+                    f"E={seek_ema_e:.2f}  w={beacon_weight:.2f}  s={current_support}"
+                )
                 tgt_xy   = frontier_xy
             else:
                 mode_str = f"EXPLORE  cov={cov:.1f}%"
@@ -2459,7 +2539,8 @@ def main():
                 _d_fwd = f"  dfwd={float(depth_sig[1]):.2f}m" if depth_sig is not None else ""
                 mode_dbg = (
                     f"TRACK:{waypoints[seeking_idx].name}  E={seek_score:.2f}"
-                    f"  w={beacon_weight:.2f}{_d_fwd}  front=({frontier_xy[0]:.2f},{frontier_xy[1]:.2f})"
+                    f"  w={beacon_weight:.2f}  s={current_support}{_d_fwd}"
+                    f"  front=({frontier_xy[0]:.2f},{frontier_xy[1]:.2f})"
                     f"{via_str}  hdg={math.degrees(hdg_to_f):+.0f}deg"
                 )
             else:
