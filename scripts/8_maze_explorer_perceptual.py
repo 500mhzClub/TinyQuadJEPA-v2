@@ -139,6 +139,7 @@ LOG_ODDS_FREE_THRESH   = -2
 OCC_HIT_CLUSTER_EPS_M  = 0.10
 OCC_HIT_MIN_ROWS       = 3
 OCC_HIT_MIN_FRAC       = 0.16
+DETECT_WALL_MARGIN_M   = 0.18
 UNKNOWN_TRAVERSE_COST  = 2.6
 VISIT_TRAVERSE_COST    = 0.10
 PATH_VISIT_PENALTY     = 0.18
@@ -573,6 +574,39 @@ def robust_depth_column_distance(ray, depth_max):
     return clear_dist, None
 
 
+def bearing_depth_stats(depth_img, bearing_err_rad, depth_max,
+                        cam_pitch_rad=None, cam_height_m=None,
+                        fov_deg=BRAIN_CAM_FOV_DEG):
+    d = normalize_depth_image(depth_img, depth_max)
+    if d is None:
+        return None
+    half_fov = math.radians(max(float(fov_deg) * 0.5, 1e-3))
+    if abs(bearing_err_rad) > half_fov + math.radians(2.0):
+        return None
+
+    h, w = d.shape
+    x_norm = clamp(float(bearing_err_rad) / half_fov, -1.0, 1.0)
+    c_mid = int(round((x_norm * 0.5 + 0.5) * max(w - 1, 1)))
+    c0 = max(0, c_mid - 2)
+    c1 = min(w, c_mid + 3)
+    row_lo, row_hi = floor_safe_row_bounds(
+        h, 0.02, 0.48, depth_max,
+        cam_pitch_rad=cam_pitch_rad,
+        cam_height_m=cam_height_m,
+        fov_deg=fov_deg,
+        floor_margin_frac=DEPTH_OCC_FLOOR_MARGIN_FRAC,
+    )
+    patch = d[row_lo:row_hi, c0:c1]
+    if not patch.size:
+        return None
+    clear_fwd, hit_fwd = robust_depth_column_distance(patch.reshape(-1), depth_max)
+    return {
+        "x_norm": x_norm,
+        "clear_range": clear_fwd,
+        "hit_range": hit_fwd,
+    }
+
+
 def depth_guard_stats(depth_img, depth_max, cam_pitch_rad=None, cam_height_m=None,
                       fov_deg=BRAIN_CAM_FOV_DEG):
     d = normalize_depth_image(depth_img, depth_max)
@@ -606,7 +640,7 @@ def front_depth_guard_stats(depth_img, depth_max, cam_pitch_rad=None, cam_height
         return None
     h, w = d.shape
     row_lo, row_hi = floor_safe_row_bounds(
-        h, 0.10, 0.70, depth_max,
+        h, 0.08, 0.62, depth_max,
         cam_pitch_rad=cam_pitch_rad,
         cam_height_m=cam_height_m,
         fov_deg=fov_deg,
@@ -617,9 +651,26 @@ def front_depth_guard_stats(depth_img, depth_max, cam_pitch_rad=None, cam_height
     center = d[row_lo:row_hi, c0:c1]
     if not center.size:
         return None
+    clear_vals = []
+    hit_vals = []
+    close_cols = 0
+    n_cols = max(int(center.shape[1]), 1)
+    for col in range(center.shape[1]):
+        clear_dist, hit_dist = robust_depth_column_distance(center[:, col], depth_max)
+        clear_vals.append(clear_dist)
+        if hit_dist is not None:
+            hit_vals.append(hit_dist)
+            if hit_dist < FRONT_STOP_DIST:
+                close_cols += 1
+    min_hit_cols = max(2, int(math.ceil(0.20 * float(n_cols))))
+    center_hit_q35 = (
+        None if len(hit_vals) < min_hit_cols
+        else float(np.nanpercentile(np.asarray(hit_vals, np.float32), 35))
+    )
     return {
-        "center_q35": float(np.nanpercentile(center, 35)),
-        "center_close_frac": float(np.mean(center < FRONT_STOP_DIST)),
+        "center_clear_q35": float(np.nanpercentile(np.asarray(clear_vals, np.float32), 35)),
+        "center_hit_q35": center_hit_q35,
+        "center_close_frac": float(close_cols) / float(n_cols),
     }
 
 
@@ -649,8 +700,11 @@ def front_blocked_from_depth(depth_img, depth_max, cam_pitch_rad=None, cam_heigh
     )
     if stats is None:
         return False
+    hit_q35 = stats["center_hit_q35"]
+    if hit_q35 is None:
+        return False
     return (
-        stats["center_q35"] < FRONT_STOP_DIST
+        hit_q35 < FRONT_STOP_DIST
         or stats["center_close_frac"] > FRONT_BLOCKED_FRAC
     )
 
@@ -679,23 +733,16 @@ def make_escape_cmd_from_depth(depth_img, depth_max, dev,
 def reinforce_front_obstacle(sm, robot_xy, robot_yaw, depth_img, depth_max,
                              cam_pitch_rad=None, cam_height_m=None,
                              fov_deg=BRAIN_CAM_FOV_DEG):
-    d = normalize_depth_image(depth_img, depth_max)
-    if d is None:
+    stats = front_depth_guard_stats(
+        depth_img, depth_max,
+        cam_pitch_rad=cam_pitch_rad,
+        cam_height_m=cam_height_m,
+        fov_deg=fov_deg,
+    )
+    if stats is None or stats["center_hit_q35"] is None:
         hit_dist = FRONT_STOP_DIST
     else:
-        h, w = d.shape
-        row_lo, row_hi = floor_safe_row_bounds(
-            h, 0.12, 0.62, depth_max,
-            cam_pitch_rad=cam_pitch_rad,
-            cam_height_m=cam_height_m,
-            fov_deg=fov_deg,
-            floor_margin_frac=DEPTH_GUARD_FLOOR_MARGIN_FRAC,
-        )
-        c0 = max(0, int(0.44 * w))
-        c1 = min(w, max(c0 + 1, int(0.56 * w)))
-        center = d[row_lo:row_hi, c0:c1]
-        hit_dist = float(np.nanpercentile(center, 35)) if center.size else FRONT_STOP_DIST
-        hit_dist = float(clamp(hit_dist, 0.12, depth_max * 0.7))
+        hit_dist = float(clamp(stats["center_hit_q35"], 0.12, depth_max * 0.7))
     hit_xy = robot_xy + np.array([math.cos(robot_yaw), math.sin(robot_yaw)], np.float32) * hit_dist
     for _ in range(2):
         mark_disc(sm, hit_xy, max(OCC_INFLATION_RADIUS, 0.14), MAP_OCC)
@@ -721,8 +768,15 @@ def update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth_img, fov_deg, de
     # These rows correspond to roughly horizontal or upward-facing rays and
     # will NOT hit the floor within depth_max.  Rows below this line look
     # downward and produce ground-return false positives.
-    row_lo, row_hi = floor_safe_row_bounds(
-        h, 0.02, 0.62, depth_max,
+    free_row_lo, free_row_hi = floor_safe_row_bounds(
+        h, 0.08, 0.68, depth_max,
+        cam_pitch_rad=cam_pitch_rad,
+        cam_height_m=cam_height_m,
+        fov_deg=fov_deg,
+        floor_margin_frac=DEPTH_OCC_FLOOR_MARGIN_FRAC,
+    )
+    hit_row_lo, hit_row_hi = floor_safe_row_bounds(
+        h, 0.02, 0.48, depth_max,
         cam_pitch_rad=cam_pitch_rad,
         cam_height_m=cam_height_m,
         fov_deg=fov_deg,
@@ -731,12 +785,15 @@ def update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth_img, fov_deg, de
 
     cols = np.unique(np.clip(np.linspace(int(0.08*w), int(0.92*w), 49).astype(int), 0, w-1))
     for c in cols:
-        ray = d[row_lo:row_hi, c]
-        if not ray.size:
+        clear_ray = d[free_row_lo:free_row_hi, c]
+        hit_ray = d[hit_row_lo:hit_row_hi, c]
+        if not clear_ray.size and not hit_ray.size:
             continue
-        clear_dist, hit_dist = robust_depth_column_distance(ray, depth_max)
+        clear_dist, _ = robust_depth_column_distance(clear_ray, depth_max)
+        _, hit_dist = robust_depth_column_distance(hit_ray, depth_max) if hit_ray.size else (depth_max, None)
         x_norm = (float(c)/max(float(w-1),1.0))*2.0-1.0
-        ray_yaw = robot_yaw + math.radians(0.5*fov_deg)*x_norm
+        ray_ang = math.radians(0.5*fov_deg) * x_norm
+        ray_yaw = robot_yaw + ray_ang
         ray_dir = np.array([math.cos(ray_yaw), math.sin(ray_yaw)], np.float32)
 
         # Mark free space along ray.
@@ -744,9 +801,6 @@ def update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth_img, fov_deg, de
         for t in np.linspace(0.06, free_until, max(2, int(free_until/max(sm.res*0.7,0.04)))):
             mark_disc(sm, robot_xy + ray_dir * float(t), 0.04, MAP_FREE)
 
-        # Vote for OCC at the endpoint.
-        # Use the nearest robust hit in the safe row band so far background
-        # does not wash out vertical wall returns in the 2D map projection.
         if hit_dist is not None:
             mark_disc(sm, robot_xy + ray_dir * hit_dist, OCC_INFLATION_RADIUS, MAP_OCC)
 
@@ -1886,7 +1940,7 @@ def main():
         detect_e = None
         detect_second_e = None
         detect_kind = None
-        if (seeking_idx < 0 and guard_steps <= 0 and clip_retreat_steps <= 0
+        if (seeking_idx < 0 and clip_retreat_steps <= 0
                 and step % DETECT_STRIDE == 0):
             detected, detect_e, detect_second_e, detect_kind = check_detections(
                 z_current, head, bc_lats, found, seeking_idx,
@@ -1900,16 +1954,25 @@ def main():
                 _d2b = float(np.linalg.norm(_dwp.pos - robot_xy))
                 _bear = math.atan2(float(_dwp.pos[1] - robot_xy[1]),
                                    float(_dwp.pos[0] - robot_xy[0]))
-                _bear_err = abs(wrap_to_pi(_bear - robot_yaw))
+                _bear_delta = wrap_to_pi(_bear - robot_yaw)
+                _bear_err = abs(_bear_delta)
                 _half_fov = math.radians(BRAIN_CAM_FOV_DEG / 2 + 12.0)  # 12° tolerance
-                _wall_blocking = (depth_sig is not None
-                                  and _d2b > 1.0
-                                  and float(depth_sig[1]) < _d2b * 0.55)
+                _bearing_stats = bearing_depth_stats(
+                    depth, _bear_delta, args.depth_max,
+                    cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
+                    fov_deg=BRAIN_CAM_FOV_DEG,
+                )
+                _hit_range = None if _bearing_stats is None else _bearing_stats["hit_range"]
+                _wall_blocking = (
+                    _hit_range is not None
+                    and _d2b > 1.0
+                    and float(_hit_range) + DETECT_WALL_MARGIN_M < _d2b
+                )
                 if _bear_err > _half_fov:
                     print(f"  [DETECT-SKIP] {_dwp.name} bearing error={math.degrees(_bear_err):.0f}° > FOV")
                     detected = None; detect_kind = None
                 elif _wall_blocking:
-                    print(f"  [DETECT-SKIP] {_dwp.name} wall blocks: dfwd={float(depth_sig[1]):.2f}m < d2b={_d2b:.2f}m")
+                    print(f"  [DETECT-SKIP] {_dwp.name} wall blocks: dhit={float(_hit_range):.2f}m < d2b={_d2b:.2f}m")
                     detected = None; detect_kind = None
         if detected is not None and seeking_idx < 0:
             detect_wp = waypoints[detected]
@@ -2267,13 +2330,20 @@ def main():
             depth_blocked = (
                 depth_stats is not None
                 and (
-                    depth_stats["center_q35"] < FRONT_STOP_DIST
+                    (
+                        depth_stats["center_hit_q35"] is not None
+                        and depth_stats["center_hit_q35"] < FRONT_STOP_DIST
+                    )
                     or depth_stats["center_close_frac"] > FRONT_BLOCKED_FRAC
                 )
             )
             depth_clearance = (
                 args.depth_max if depth_stats is None
-                else float(depth_stats["center_q35"])
+                else float(
+                    depth_stats["center_hit_q35"]
+                    if depth_stats["center_hit_q35"] is not None
+                    else depth_stats["center_clear_q35"]
+                )
             )
             occ_hits = sample_front_occ_hits(sm, robot_xy, robot_yaw)
             occ_near = int(occ_hits[0]) + int(occ_hits[1])
