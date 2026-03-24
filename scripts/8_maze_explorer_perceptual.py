@@ -1742,7 +1742,7 @@ def main():
                         help="Torch device: auto | cuda | cpu.")
     parser.add_argument("--sim_backend", type=str, default="auto",
                         help="Genesis backend: auto | amdgpu | vulkan | gpu | cuda | metal | cpu.")
-    parser.add_argument("--n_steps",     type=int,   default=4000)
+    parser.add_argument("--n_steps",     type=int,   default=14000)
     parser.add_argument("--cands",       type=int,   default=512)
     parser.add_argument("--horizon",     type=int,   default=15)
     parser.add_argument("--map_res",     type=float, default=0.10)
