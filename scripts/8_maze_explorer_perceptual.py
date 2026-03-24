@@ -4,14 +4,15 @@ JEPA v2 — Perceptual Maze Explorer  (no pre-loaded map)
 
 Fully perception-driven variant of 7_maze_explorer.py.  No maze geometry is
 pre-seeded into the occupancy grid; walls are discovered entirely from the
-onboard depth camera using a vote-based occupancy scheme:
+onboard depth camera using a persistent inverse-sensor occupancy scheme:
 
   • Free space  — any cell a depth ray passes *through* is marked free.
-  • Occupied    — a cell accumulates hit-votes from depth ray endpoints; it
-                  is only promoted to MAP_OCC after OCC_VOTE_THRESH consistent
-                  hits, and free-traversal votes can reverse an OCC marking.
+  • Occupied    — a cell accumulates stronger positive evidence from depth-hit
+                  endpoints, while free traversals apply weaker negative
+                  evidence so observed walls persist unless the camera keeps
+                  seeing through them consistently.
 
-OCC endpoint voting is restricted to the upper ~66 % of the depth image
+Occupied-hit updates are restricted to the upper ~66 % of the depth image
 (rows that correspond to roughly horizontal or upward gaze) to suppress
 ground-return false positives that appear in the downward-facing lower rows.
 
@@ -27,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import heapq
 import math
 import os
 import sys
@@ -95,11 +97,12 @@ BREADCRUMB_YAW_OFFSETS_DEG = (-28.0, -12.0, 0.0, 12.0, 28.0)
 LATENT_MEMORY_MAX = 512
 LATENT_MEMORY_STRIDE = 4
 LATENT_MEMORY_MIN_STEP_DIST = 0.10
-LATENT_MEMORY_MIN_COS = 0.985
-LATENT_NOVELTY_WEIGHT = 2.20
+LATENT_NOVELTY_WEIGHT = 1.10
+PLACE_MEMORY_CELL_M = 0.28
+PLACE_MEMORY_YAW_BINS = 12
+PLACE_LATENT_EMA_DECAY = 0.80
 
 # ── Perceptual OCC parameters ──────────────────────────────────────────── #
-OCC_VOTE_THRESH = 4     # hits needed before a cell is promoted to MAP_OCC
 MIN_OCC_DEPTH   = 0.25  # ignore depth endpoints closer than this (body / feet)
 ROBOT_SELF_FREE_RADIUS = 0.08   # don't erase nearby walls with an oversized free bubble
 ROBOT_CLEARANCE_RADIUS = 0.14   # conservative footprint used for LOS / reachability tests
@@ -127,6 +130,16 @@ SEEK_STALL_DEPTH_DELTA = 0.05
 SEEK_RECOVERY_COOLDOWN = 30
 LINE_CHECK_STEP_M      = 0.05
 DETECTION_CLEARANCE_RADIUS = 0.08
+FREE_LOG_ODDS_DEC      = 1
+OCC_LOG_ODDS_INC       = 4
+LOG_ODDS_MIN           = -24
+LOG_ODDS_MAX           = 24
+LOG_ODDS_OCC_THRESH    = 6
+LOG_ODDS_FREE_THRESH   = -2
+UNKNOWN_TRAVERSE_COST  = 2.6
+VISIT_TRAVERSE_COST    = 0.10
+PATH_VISIT_PENALTY     = 0.18
+FRONTIER_VISIT_PENALTY = 0.35
 
 
 # --------------------------------------------------------------------------- #
@@ -357,14 +370,14 @@ def get_jepa_state(robot, cam_brain, q0, prev_action, dofs, dev):
 
 
 # --------------------------------------------------------------------------- #
-# Sensor map  —  vote-based occupancy (no pre-loaded walls)
+# Sensor map  —  persistent occupancy from perception only
 # --------------------------------------------------------------------------- #
 
 @dataclass
 class SensorMap:
     grid:        np.ndarray   # MAP_UNKNOWN / MAP_FREE / MAP_OCC
     free_visits: np.ndarray   # cumulative free-ray traversals per cell
-    occ_votes:   np.ndarray   # cumulative hit-ray count per cell
+    log_odds:    np.ndarray   # asymmetric free/occ evidence accumulator
     res:         float
 
     @property
@@ -394,6 +407,20 @@ def grid_to_world(sm, rc):
     return np.array([float(WORLD_MIN[0])+(c+0.5)*sm.res,
                      float(WORLD_MIN[1])+(r+0.5)*sm.res], dtype=np.float32)
 
+
+def _refresh_grid_cell(sm, r, c, prev_cell=None):
+    prev = int(sm.grid[r, c]) if prev_cell is None else int(prev_cell)
+    lo = int(sm.log_odds[r, c])
+    if lo >= LOG_ODDS_OCC_THRESH:
+        sm.grid[r, c] = MAP_OCC
+    elif lo <= LOG_ODDS_FREE_THRESH or (
+        sm.free_visits[r, c] > 0 and (lo <= 0 or prev == MAP_FREE)
+    ):
+        sm.grid[r, c] = MAP_FREE
+    else:
+        sm.grid[r, c] = MAP_UNKNOWN
+
+
 def mark_disc(sm, xy, radius, value):
     g = world_to_grid(sm, xy)
     if g is None: return
@@ -403,18 +430,20 @@ def mark_disc(sm, xy, radius, value):
         for c in range(max(0,c0-rr), min(sm.w,c0+rr+1)):
             p = grid_to_world(sm, (r,c))
             if float(np.linalg.norm(p - xy[:2])) <= radius:
+                prev_cell = int(sm.grid[r, c])
                 if value == MAP_FREE:
-                    sm.free_visits[r,c] += 1
-                    if sm.grid[r,c] != MAP_OCC:
-                        sm.grid[r,c] = MAP_FREE
-                    elif sm.free_visits[r,c] >= sm.occ_votes[r,c]:
-                        # Free traversals now match or exceed hit votes — revert.
-                        sm.grid[r,c] = MAP_FREE
+                    sm.free_visits[r, c] += 1
+                    sm.log_odds[r, c] = max(
+                        LOG_ODDS_MIN,
+                        int(sm.log_odds[r, c]) - FREE_LOG_ODDS_DEC,
+                    )
+                    _refresh_grid_cell(sm, r, c, prev_cell)
                 elif value == MAP_OCC:
-                    sm.occ_votes[r,c] = min(int(sm.occ_votes[r,c]) + 1, 127)
-                    if (sm.occ_votes[r,c] >= OCC_VOTE_THRESH
-                            and sm.free_visits[r,c] < sm.occ_votes[r,c]):
-                        sm.grid[r,c] = MAP_OCC
+                    sm.log_odds[r, c] = min(
+                        LOG_ODDS_MAX,
+                        int(sm.log_odds[r, c]) + OCC_LOG_ODDS_INC,
+                    )
+                    _refresh_grid_cell(sm, r, c, prev_cell)
 
 def sample_cell(sm, xy):
     g = world_to_grid(sm, xy)
@@ -519,6 +548,21 @@ def floor_safe_row_bounds(
     if row_hi <= row_lo:
         row_hi = min(h, row_lo + max(1, int(0.04 * h)))
     return row_lo, row_hi
+
+
+def robust_depth_column_distance(ray, depth_max):
+    ray = np.asarray(ray, np.float32)
+    valid = ray[np.isfinite(ray)]
+    if valid.size == 0:
+        return depth_max, None
+
+    hits = valid[(valid >= MIN_OCC_DEPTH) & (valid < depth_max * 0.985)]
+    if hits.size > 0:
+        hit_dist = float(clamp(float(np.nanpercentile(hits, 20)), MIN_OCC_DEPTH, depth_max))
+        return hit_dist, hit_dist
+
+    clear_dist = float(clamp(float(np.nanpercentile(valid, 70)), 0.05, depth_max))
+    return clear_dist, None
 
 
 def depth_guard_stats(depth_img, depth_max, cam_pitch_rad=None, cam_height_m=None,
@@ -651,7 +695,7 @@ def reinforce_front_obstacle(sm, robot_xy, robot_yaw, depth_img, depth_max,
 
 def update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth_img, fov_deg, depth_max,
                                  cam_pitch_rad=None, cam_height_m=None):
-    """Update occupancy purely from depth.  OCC uses vote accumulation."""
+    """Update occupancy purely from depth using asymmetric free/occ evidence."""
     mark_disc(sm, robot_xy, ROBOT_SELF_FREE_RADIUS, MAP_FREE)
 
     d = normalize_depth_image(depth_img, depth_max)
@@ -677,25 +721,26 @@ def update_sensor_map_from_depth(sm, robot_xy, robot_yaw, depth_img, fov_deg, de
         floor_margin_frac=DEPTH_OCC_FLOOR_MARGIN_FRAC,
     )
 
-    cols = np.unique(np.clip(np.linspace(int(0.08*w), int(0.92*w), 41).astype(int), 0, w-1))
+    cols = np.unique(np.clip(np.linspace(int(0.08*w), int(0.92*w), 49).astype(int), 0, w-1))
     for c in cols:
         ray = d[row_lo:row_hi, c]
-        if not ray.size: continue
-        dist = float(clamp(float(np.nanmedian(ray)), 0.05, depth_max))
+        if not ray.size:
+            continue
+        clear_dist, hit_dist = robust_depth_column_distance(ray, depth_max)
         x_norm = (float(c)/max(float(w-1),1.0))*2.0-1.0
         ray_yaw = robot_yaw + math.radians(0.5*fov_deg)*x_norm
         ray_dir = np.array([math.cos(ray_yaw), math.sin(ray_yaw)], np.float32)
 
         # Mark free space along ray.
-        free_until = max(0.0, dist - FREE_RAY_CLEARANCE)
+        free_until = max(0.0, clear_dist - FREE_RAY_CLEARANCE)
         for t in np.linspace(0.06, free_until, max(2, int(free_until/max(sm.res*0.7,0.04)))):
             mark_disc(sm, robot_xy + ray_dir * float(t), 0.04, MAP_FREE)
 
         # Vote for OCC at the endpoint.
-        # Skip readings that are too close (robot body / feet) or at the far
-        # clipping plane (unreliable / open sky).
-        if MIN_OCC_DEPTH <= dist < depth_max * 0.92:
-            mark_disc(sm, robot_xy + ray_dir * dist, OCC_INFLATION_RADIUS, MAP_OCC)
+        # Use the nearest robust hit in the safe row band so far background
+        # does not wash out vertical wall returns in the 2D map projection.
+        if hit_dist is not None:
+            mark_disc(sm, robot_xy + ray_dir * hit_dist, OCC_INFLATION_RADIUS, MAP_OCC)
 
 
 def _frontier_reachable(sm, robot_xy, target_xy, n_samples=10, allow_unknown=False):
@@ -746,17 +791,41 @@ def nearest_cell_with_value(sm, goal_xy, value, max_radius_m=0.45):
     return best_rc
 
 
+def local_visit_score(sm, rc, radius_cells=2):
+    r0, c0 = int(rc[0]), int(rc[1])
+    acc = 0.0
+    count = 0
+    rr2 = float(radius_cells * radius_cells)
+    for r in range(max(0, r0 - radius_cells), min(sm.h, r0 + radius_cells + 1)):
+        for c in range(max(0, c0 - radius_cells), min(sm.w, c0 + radius_cells + 1)):
+            if float((r - r0) ** 2 + (c - c0) ** 2) > rr2 + 0.25:
+                continue
+            acc += math.log1p(max(int(sm.free_visits[r, c]), 0))
+            count += 1
+    return 0.0 if count == 0 else acc / float(count)
+
+
 def bfs_next_waypoint(
     sm: "SensorMap", robot_xy: np.ndarray, goal_xy: np.ndarray,
     lookahead_m: float = 0.7, allow_unknown: bool = True,
     snap_goal_to_free: bool = True,
 ) -> Optional[np.ndarray]:
-    from collections import deque as _deque
     start = world_to_grid(sm, robot_xy)
     end   = world_to_grid(sm, goal_xy)
     if start is None or end is None:
         return None
-    if not allow_unknown and sm.grid[end[0], end[1]] != MAP_FREE:
+    end_cell = int(sm.grid[end[0], end[1]])
+    if end_cell == MAP_OCC:
+        if not snap_goal_to_free:
+            return None
+        snapped = nearest_cell_with_value(sm, goal_xy, MAP_FREE, max_radius_m=0.45)
+        if snapped is None and allow_unknown:
+            snapped = nearest_cell_with_value(sm, goal_xy, MAP_UNKNOWN, max_radius_m=0.45)
+        if snapped is None:
+            return None
+        end = snapped
+        end_cell = int(sm.grid[end[0], end[1]])
+    if not allow_unknown and end_cell != MAP_FREE:
         if not snap_goal_to_free:
             return None
         snapped = nearest_cell_with_value(sm, goal_xy, MAP_FREE, max_radius_m=0.45)
@@ -767,10 +836,13 @@ def bfs_next_waypoint(
         return grid_to_world(sm, end)
 
     prev: dict = {start: None}
-    queue = _deque([start])
+    best_cost: Dict[Tuple[int, int], float] = {start: 0.0}
+    heap: List[Tuple[float, Tuple[int, int]]] = [(0.0, start)]
 
-    while queue:
-        cur = queue.popleft()
+    while heap:
+        cur_cost, cur = heapq.heappop(heap)
+        if cur_cost > best_cost.get(cur, float("inf")) + 1e-8:
+            continue
         if cur == end:
             break
         r, c = cur
@@ -778,16 +850,24 @@ def bfs_next_waypoint(
                        (-1, -1), (-1, 1), (1, -1), (1, 1)):
             nr, nc = r + dr, c + dc
             if 0 <= nr < sm.h and 0 <= nc < sm.w:
+                if dr != 0 and dc != 0:
+                    if sm.grid[r, nc] == MAP_OCC or sm.grid[nr, c] == MAP_OCC:
+                        continue
                 nxt = (nr, nc)
-                if nxt in prev:
-                    continue
                 cell = sm.grid[nr, nc]
                 if cell == MAP_OCC:
                     continue
                 if not allow_unknown and cell != MAP_FREE:
                     continue
-                prev[nxt] = cur
-                queue.append(nxt)
+                step_cost = math.sqrt(2.0) if dr != 0 and dc != 0 else 1.0
+                if cell == MAP_UNKNOWN:
+                    step_cost *= UNKNOWN_TRAVERSE_COST
+                step_cost += VISIT_TRAVERSE_COST * math.log1p(max(int(sm.free_visits[nr, nc]), 0))
+                new_cost = cur_cost + step_cost
+                if new_cost + 1e-8 < best_cost.get(nxt, float("inf")):
+                    best_cost[nxt] = new_cost
+                    prev[nxt] = cur
+                    heapq.heappush(heap, (new_cost, nxt))
     else:
         return None
 
@@ -818,7 +898,7 @@ def select_frontier(sm, robot_xy, blacklist=None, bl_radius=0.40):
             if dist < 0.20: continue
             if any(float(np.linalg.norm(wp-bp)) < bl_radius for bp in bl): continue
             reach = 2.0 if _frontier_reachable(sm, robot_xy, wp) else -1.5
-            visit_pen = min(int(sm.free_visits[r, c]) * 0.08, 1.2)
+            visit_pen = min(FRONTIER_VISIT_PENALTY * local_visit_score(sm, (r, c)), 1.8)
             cands.append((0.45*float(unk) - 0.30*dist - 0.35*float(occ) + reach - visit_pen, wp))
     if not cands:
         if bl:
@@ -1014,6 +1094,17 @@ def local_unknown_gain_batched_torch(sm, end_xy_t, unknown_grid=None, radius=0.5
     return counts * 0.08
 
 
+def path_visit_penalty_batched_torch(sm, paths_t, visit_grid=None):
+    N, hz, _ = paths_t.shape
+    if visit_grid is None:
+        visit_grid = torch.as_tensor(sm.free_visits, device=paths_t.device)
+    pts = paths_t.reshape(-1, 2)
+    gx = (((pts[:, 0] - float(WORLD_MIN[0])) / sm.res).long()).clamp_(0, sm.w - 1)
+    gy = (((pts[:, 1] - float(WORLD_MIN[1])) / sm.res).long()).clamp_(0, sm.h - 1)
+    visits = torch.log1p(visit_grid[gy, gx].to(paths_t.dtype))
+    return visits.view(N, hz).mean(dim=1)
+
+
 def normalize_latents_t(latents: torch.Tensor) -> torch.Tensor:
     return latents / latents.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
@@ -1030,30 +1121,44 @@ def latent_bank_novelty_torch(
 
 
 @torch.no_grad()
-def maybe_add_latent_memory(
-    memory_bank: Optional[torch.Tensor],
-    memory_bank_norm: Optional[torch.Tensor],
-    z_target: torch.Tensor,
+def place_memory_key(robot_xy: np.ndarray, robot_yaw: float):
+    cell_x = int(math.floor((float(robot_xy[0]) - float(WORLD_MIN[0])) / PLACE_MEMORY_CELL_M))
+    cell_y = int(math.floor((float(robot_xy[1]) - float(WORLD_MIN[1])) / PLACE_MEMORY_CELL_M))
+    yaw_norm = (wrap_to_pi(robot_yaw) + math.pi) / (2.0 * math.pi)
+    yaw_bin = int(math.floor(yaw_norm * PLACE_MEMORY_YAW_BINS)) % PLACE_MEMORY_YAW_BINS
+    return cell_x, cell_y, yaw_bin
+
+
+@torch.no_grad()
+def update_place_memory(
+    memory_slots: Dict[Tuple[int, int, int], torch.Tensor],
+    z_online: torch.Tensor,
+    robot_xy: np.ndarray,
+    robot_yaw: float,
     max_size: int = LATENT_MEMORY_MAX,
-    min_cos: float = LATENT_MEMORY_MIN_COS,
 ):
-    z = z_target.detach()
+    z = z_online.detach()
     if z.dim() == 1:
         z = z.unsqueeze(0)
-    z = z[:1]
-    z_norm = normalize_latents_t(z)
+    z = z[:1].clone()
+    key = place_memory_key(robot_xy, robot_yaw)
 
-    if memory_bank_norm is not None and memory_bank_norm.numel() > 0:
-        max_sim = float((z_norm @ memory_bank_norm.t()).max().item())
-        if max_sim >= min_cos:
-            return memory_bank, memory_bank_norm, False
+    added = key not in memory_slots
+    if key in memory_slots:
+        prev = memory_slots.pop(key)
+        z = PLACE_LATENT_EMA_DECAY * prev + (1.0 - PLACE_LATENT_EMA_DECAY) * z
+    memory_slots[key] = z
 
-    if memory_bank is None or memory_bank.numel() == 0:
-        return z.clone(), z_norm.clone(), True
+    while len(memory_slots) > max_size:
+        oldest_key = next(iter(memory_slots))
+        memory_slots.pop(oldest_key)
 
-    memory_bank = torch.cat([memory_bank, z], dim=0)[-max_size:]
-    memory_bank_norm = torch.cat([memory_bank_norm, z_norm], dim=0)[-max_size:]
-    return memory_bank, memory_bank_norm, True
+    if not memory_slots:
+        return memory_slots, None, None, added
+
+    memory_bank = torch.cat(list(memory_slots.values()), dim=0)
+    memory_bank_norm = normalize_latents_t(memory_bank)
+    return memory_slots, memory_bank, memory_bank_norm, added
 
 
 # --------------------------------------------------------------------------- #
@@ -1276,39 +1381,96 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
         nudge = torch.tensor([[0.16, 0.0, 0.45]], device=dev, dtype=torch.float32)
         return nudge, np.zeros((hz, 2), np.float32)
 
-    goal_dir_body = world_to_body_xy(robot_yaw, goal_vec / max(goal_dist, 1e-8))
+    goal_body_xy = world_to_body_xy(robot_yaw, goal_vec / max(goal_dist, 1e-8))
     hdg_err = wrap_to_pi(math.atan2(float(goal_vec[1]), float(goal_vec[0])) - robot_yaw)
-    front_align = max(0.0, float(goal_dir_body[0]))
-    side_err = float(goal_dir_body[1])
-    vx = 0.10 + 0.24 * front_align + 0.06 * float(np.clip(goal_dist, 0.0, 1.0))
-    vy = 0.10 * side_err
-    wz = 1.10 * hdg_err
+    far = goal_dist > 0.8
+    transl_scale = 0.30 if far else 0.20
+    if abs(hdg_err) > 0.9:
+        transl_scale *= 0.50
 
-    if abs(hdg_err) > 1.00:
-        vx *= 0.18
-        vy *= 0.25
-    elif abs(hdg_err) > 0.65:
-        vx *= 0.45
-        vy *= 0.60
+    if abs(hdg_err) > math.pi * 0.55:
+        mean = torch.tensor([0.0, 0.0, math.copysign(0.70, hdg_err)],
+                            device=dev, dtype=torch.float32)
+        std = torch.tensor([0.05, 0.04, 0.14], device=dev, dtype=torch.float32)
+    else:
+        mean = torch.tensor([
+            clamp(float(goal_body_xy[0]) * transl_scale, 0.0, 0.36),
+            clamp(float(goal_body_xy[1]) * 0.10, -0.10, 0.10),
+            clamp(0.55 * hdg_err, -0.72, 0.72),
+        ], device=dev, dtype=torch.float32)
+        std = torch.tensor([
+            0.13 if far else 0.09,
+            0.08 if far else 0.06,
+            0.24 if far else 0.18,
+        ], device=dev, dtype=torch.float32)
 
-    if goal_dist < 0.45:
-        vx *= 0.65
-        vy *= 0.60
+    occ_grid = torch.as_tensor(sm.grid == MAP_OCC, device=dev)
+    unknown_grid = torch.as_tensor(sm.grid == MAP_UNKNOWN, device=dev)
+    visit_grid = torch.as_tensor(sm.free_visits, device=dev)
+    goal_t = torch.tensor(frontier_xy, device=dev, dtype=torch.float32)
+    z_ref_norm = float(zc.norm(dim=-1).mean().item()) + 1e-6
 
-    cmd = torch.tensor([[
-        clamp(vx, 0.04 if abs(hdg_err) < 0.90 else 0.0, 0.34),
-        clamp(vy, -0.08, 0.08),
-        clamp(wz, -0.70, 0.70),
-    ]], device=dev, dtype=torch.float32)
+    best_cmd = mean.view(1, 3)
+    best_cost = None
+    best_path = None
 
-    if prev_cmd is not None:
-        cmd = 0.75 * cmd + 0.25 * prev_cmd
-        cmd[:, 0].clamp_(0.0, 0.34)
-        cmd[:, 1].clamp_(-0.08, 0.08)
-        cmd[:, 2].clamp_(-0.70, 0.70)
+    for _ in range(4):
+        cmds = mean + std * torch.randn((cands, 3), device=dev)
+        cmds[:, 0].clamp_(0.0, 0.38)
+        cmds[:, 1].clamp_(-0.12, 0.12)
+        cmds[:, 2].clamp_(-0.75, 0.75)
 
-    path_t, _ = rollout_cmds_batched_paths(robot_xy, robot_yaw, cmd, hz)
-    return cmd, path_t[0].detach().cpu().numpy()
+        z_roll = zc.expand(cands, -1)
+        h_t = torch.zeros((cands, jepa.latent_dim), device=dev, dtype=z_roll.dtype)
+        for _ in range(hz):
+            z_roll, h_t = jepa.predictor(z_roll, cmds, h_t)
+
+        latent_mag = z_roll.norm(dim=-1) / z_ref_norm
+        novelty_t = latent_bank_novelty_torch(z_roll, latent_memory_norm)
+
+        paths_t, end_xy_t = rollout_cmds_batched_paths(robot_xy, robot_yaw, cmds, hz)
+        _, end_yaw_t = rollout_cmds_batched(robot_xy, robot_yaw, cmds, hz)
+
+        coll_t = path_collision_penalty_batched_torch(sm, paths_t, occ_grid)
+        visit_t = path_visit_penalty_batched_torch(sm, paths_t, visit_grid)
+        frontier_t = local_unknown_gain_batched_torch(sm, end_xy_t, unknown_grid, radius=0.60)
+        end_dist_t = (end_xy_t - goal_t).norm(dim=1)
+        progress_t = goal_dist - end_dist_t
+        end_ang_t = torch.atan2(goal_t[1] - end_xy_t[:, 1], goal_t[0] - end_xy_t[:, 0])
+        end_herr_t = ((end_ang_t - end_yaw_t + math.pi) % (2 * math.pi) - math.pi).abs()
+
+        latent_pen = (latent_mag - 1.5).clamp(min=0.0) * 0.15
+        smooth_pen = (
+            torch.zeros(cands, device=dev) if prev_cmd is None
+            else 0.10 * (cmds - prev_cmd).pow(2).sum(dim=-1)
+        )
+        novelty_bonus = LATENT_NOVELTY_WEIGHT * novelty_t
+
+        cost = (
+            coll_t
+            + PATH_VISIT_PENALTY * visit_t
+            + latent_pen
+            + smooth_pen
+            + 0.45 * cmds[:, 1].abs()
+            + 0.20 * end_herr_t
+            + (cmds[:, 0] < 0.03).float() * 0.10
+            - 3.20 * progress_t
+            - 0.95 * frontier_t
+            - novelty_bonus
+        )
+
+        elite_k = max(8, cands // 10)
+        elite = torch.topk(cost, k=elite_k, largest=False).indices
+        mean = cmds[elite].mean(dim=0)
+        std = cmds[elite].std(dim=0) + 1e-4
+
+        ib = int(torch.argmin(cost).item())
+        if best_cost is None or float(cost[ib]) < best_cost:
+            best_cost = float(cost[ib])
+            best_cmd = cmds[ib].detach().clone().view(1, 3)
+            best_path = paths_t[ib].detach().cpu().numpy()
+
+    return best_cmd, best_path if best_path is not None else np.zeros((hz, 2), np.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -1596,9 +1758,12 @@ def main():
     # ── Navigation state ─────────────────────────────────────────────────  #
     prev_action = torch.zeros((1,12), device=dev)
     prev_cmd:   Optional[torch.Tensor] = None
+    place_memory_slots: Dict[Tuple[int, int, int], torch.Tensor] = {}
     latent_memory: Optional[torch.Tensor] = None
     latent_memory_norm: Optional[torch.Tensor] = None
+    place_ema_latent: Optional[torch.Tensor] = None
     last_memory_xy = np.array(ROBOT_SPAWN[:2], np.float32)
+    last_memory_key: Optional[Tuple[int, int, int]] = None
 
     trail:      List[np.ndarray] = []
     recent_pos: Deque[np.ndarray] = deque(maxlen=18)
@@ -1647,7 +1812,7 @@ def main():
 
     print(f"Running perceptual maze exploration ({args.n_steps} steps)")
     print(f"  Candidates: {args.cands}  |  Horizon: {args.horizon}")
-    print(f"  OCC vote threshold: {OCC_VOTE_THRESH}  |  Min OCC depth: {MIN_OCC_DEPTH}m")
+    print(f"  OCC log-odds threshold: {LOG_ODDS_OCC_THRESH}  |  Min OCC depth: {MIN_OCC_DEPTH}m")
     print()
 
     # ── Main loop ────────────────────────────────────────────────────────  #
@@ -1666,7 +1831,13 @@ def main():
         vis, prop, _, depth = get_jepa_state(robot, cam_brain, q0, prev_action, dofs, dev)
         with torch.no_grad():
             z_current = jepa.encode_online(vis, prop).detach()
-            z_target_current = jepa.encode_target(vis, prop).detach()
+        if place_ema_latent is None:
+            place_ema_latent = z_current.clone()
+        else:
+            place_ema_latent = (
+                PLACE_LATENT_EMA_DECAY * place_ema_latent
+                + (1.0 - PLACE_LATENT_EMA_DECAY) * z_current
+            )
 
         # Update occupancy map from depth only.
         update_sensor_map_from_depth(
@@ -1685,13 +1856,16 @@ def main():
         recent_cov.append(cov)
 
         if step == 0 or step % LATENT_MEMORY_STRIDE == 0:
+            mem_key = place_memory_key(robot_xy, robot_yaw)
             mem_disp = float(np.linalg.norm(robot_xy - last_memory_xy))
-            if latent_memory is None or mem_disp >= LATENT_MEMORY_MIN_STEP_DIST:
-                latent_memory, latent_memory_norm, added = maybe_add_latent_memory(
-                    latent_memory, latent_memory_norm, z_target_current,
+            if (latent_memory is None
+                    or mem_disp >= LATENT_MEMORY_MIN_STEP_DIST
+                    or mem_key != last_memory_key):
+                place_memory_slots, latent_memory, latent_memory_norm, _ = update_place_memory(
+                    place_memory_slots, place_ema_latent, robot_xy, robot_yaw,
                 )
-                if added:
-                    last_memory_xy = robot_xy.copy()
+                last_memory_xy = robot_xy.copy()
+                last_memory_key = mem_key
 
         # ── Waypoint detection ─────────────────────────────────────────── #
         seek_timeout_cd = [max(0, c - 1) for c in seek_timeout_cd]
@@ -2000,7 +2174,8 @@ def main():
                         occ = sum(1 for rr in range(r-1,r+2) for cc in range(c-1,c+2)
                                   if not (rr==r and cc==c) and sm.grid[rr,cc]==MAP_OCC)
                         dist = float(np.linalg.norm(wp - robot_xy))
-                        score = 0.45*float(unk) - 0.30*dist - 0.35*float(occ) + 2.0
+                        visit_pen = min(FRONTIER_VISIT_PENALTY * local_visit_score(sm, (r, c)), 1.8)
+                        score = 0.45*float(unk) - 0.30*dist - 0.35*float(occ) + 2.0 - visit_pen
                         if score > best_score:
                             best_score = score
                             reachable = wp
