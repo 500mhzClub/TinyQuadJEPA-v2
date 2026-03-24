@@ -1180,7 +1180,7 @@ def plan_seek_cmd(
     # If the depth camera sees something close ahead, penalise forward motion
     # in the CEM so the world model doesn't drive the robot into unmapped walls.
     # Ramp from 0 at DEPTH_PEN_ONSET to full at DEPTH_PEN_FULL.
-    DEPTH_PEN_ONSET = 0.90   # metres — penalty starts
+    DEPTH_PEN_ONSET = 0.50   # metres — penalty starts
     DEPTH_PEN_FULL  = 0.25   # metres — full penalty
     DEPTH_PEN_COEFF = 9.0    # scales with vx; must exceed combined geo+energy pull
     depth_fwd_scale = 0.0
@@ -1864,7 +1864,6 @@ def main():
                 sig_delta = float(np.max(np.abs(seek_recent_sig[-1] - seek_recent_sig[0])))
             if (seek_disp < SEEK_STALL_DISP
                     and seek_progress < SEEK_STALL_PROGRESS
-                    and front_blocked
                     and sig_delta < SEEK_STALL_DEPTH_DELTA):
                 reinforce_front_obstacle(
                     sm, robot_xy, robot_yaw, depth, args.depth_max,
