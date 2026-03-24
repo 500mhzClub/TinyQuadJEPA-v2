@@ -1040,13 +1040,21 @@ def select_goal_proxy(sm, robot_xy, goal_xy, blacklist=None, bl_radius=0.35):
 # Kinematic rollout helpers
 # --------------------------------------------------------------------------- #
 
-def rollout_cmds_batched(start_xy, start_yaw, cmds, horizon, dt=0.10):
+def rollout_cmds_batched(start_xy, start_yaw, cmds, horizon, dt=0.10, cmds2=None, split=None):
     N   = cmds.shape[0]
     px  = cmds.new_full((N,), float(start_xy[0]))
     py  = cmds.new_full((N,), float(start_xy[1]))
     yaw = cmds.new_full((N,), float(start_yaw))
-    vx, vy, wyaw = cmds[:,0], cmds[:,1], cmds[:,2]
-    for _ in range(horizon):
+    vx1, vy1, wyaw1 = cmds[:,0], cmds[:,1], cmds[:,2]
+    if cmds2 is not None and split is not None:
+        vx2, vy2, wyaw2 = cmds2[:,0], cmds2[:,1], cmds2[:,2]
+    else:
+        vx2, vy2, wyaw2 = vx1, vy1, wyaw1
+        split = horizon
+    for t in range(horizon):
+        vx = vx1 if t < split else vx2
+        vy = vy1 if t < split else vy2
+        wyaw = wyaw1 if t < split else wyaw2
         cy, sy = torch.cos(yaw), torch.sin(yaw)
         px  = px  + dt*(cy*vx - sy*vy)
         py  = py  + dt*(sy*vx + cy*vy)
@@ -1054,15 +1062,23 @@ def rollout_cmds_batched(start_xy, start_yaw, cmds, horizon, dt=0.10):
     return torch.stack([px, py], dim=1), yaw
 
 
-def rollout_cmds_batched_paths(start_xy, start_yaw, cmds, horizon, dt=0.10):
+def rollout_cmds_batched_paths(start_xy, start_yaw, cmds, horizon, dt=0.10, cmds2=None, split=None):
     N   = cmds.shape[0]
     px  = cmds.new_full((N,), float(start_xy[0]))
     py  = cmds.new_full((N,), float(start_xy[1]))
     yaw = cmds.new_full((N,), float(start_yaw))
-    vx, vy, wyaw = cmds[:,0], cmds[:,1], cmds[:,2]
+    vx1, vy1, wyaw1 = cmds[:,0], cmds[:,1], cmds[:,2]
+    if cmds2 is not None and split is not None:
+        vx2, vy2, wyaw2 = cmds2[:,0], cmds2[:,1], cmds2[:,2]
+    else:
+        vx2, vy2, wyaw2 = vx1, vy1, wyaw1
+        split = horizon
     xs, ys = [], []
-    for _ in range(horizon):
+    for t in range(horizon):
         xs.append(px); ys.append(py)
+        vx = vx1 if t < split else vx2
+        vy = vy1 if t < split else vy2
+        wyaw = wyaw1 if t < split else wyaw2
         cy, sy = torch.cos(yaw), torch.sin(yaw)
         px  = px  + dt*(cy*vx - sy*vy)
         py  = py  + dt*(sy*vx + cy*vy)
@@ -1336,6 +1352,16 @@ def plan_seek_cmd(
             0.22 if far else 0.18,
         ], device=dev, dtype=torch.float32)
 
+    # Phase-2 mean: bias toward goal-facing forward drive after initial manoeuvre.
+    mean2 = torch.tensor([
+        clamp(0.28 * speed_scale, 0.08, 0.36),
+        0.0,
+        clamp(0.40 * heading_error, -0.55, 0.55),
+    ], device=dev, dtype=torch.float32)
+    std2 = torch.tensor([0.10, 0.04, 0.20], device=dev, dtype=torch.float32)
+
+    split = max(3, horizon // 2)
+
     best_cmd  = mean.view(1,3)
     best_cost = None
     best_path = None
@@ -1344,45 +1370,46 @@ def plan_seek_cmd(
     occ_grid = torch.as_tensor(sm.grid == MAP_OCC, device=dev)
 
     # Depth-based obstacle penalty: replaces BFS wall-avoidance.
-    # If the depth camera sees something close ahead, penalise forward motion
-    # in the CEM so the world model doesn't drive the robot into unmapped walls.
-    # Ramp from 0 at DEPTH_PEN_ONSET to full at DEPTH_PEN_FULL.
-    DEPTH_PEN_ONSET = 0.50   # metres — penalty starts
-    DEPTH_PEN_FULL  = 0.25   # metres — full penalty
-    DEPTH_PEN_COEFF = 9.0    # scales with vx; must exceed combined geo+energy pull
+    DEPTH_PEN_ONSET = 0.50
+    DEPTH_PEN_FULL  = 0.25
+    DEPTH_PEN_COEFF = 9.0
     depth_fwd_scale = 0.0
-    depth_turn_bias = 0.0    # positive → prefer +wz (turn left / ccw)
+    depth_turn_bias = 0.0
     if depth_sig is not None:
         d_center = float(depth_sig[1])
         depth_fwd_scale = float(np.clip(
             (DEPTH_PEN_ONSET - d_center) / (DEPTH_PEN_ONSET - DEPTH_PEN_FULL),
             0.0, 1.0,
         ))
-        # Bias turning toward whichever side has more open space so the robot
-        # arcs around the obstacle rather than spinning in place.
         d_left  = float(depth_sig[0])
         d_right = float(depth_sig[2])
         if depth_fwd_scale > 0.05 and abs(d_left - d_right) > 0.05:
-            # positive → left more open → prefer +wz; negative → right more open
             depth_turn_bias = float(np.clip(
                 (d_left - d_right) / max(d_center, 0.1), -1.0, 1.0,
             )) * depth_fwd_scale * 1.5
 
     for _ in range(5):
-        cmds = mean + std * torch.randn((n_candidates,3), device=dev)
-        cmds[:,0].clamp_(-vx_clamp, vx_clamp)
-        cmds[:,1].clamp_(-0.25, 0.25)
-        cmds[:,2].clamp_(-0.80, 0.80)
+        cmds1 = mean + std * torch.randn((n_candidates,3), device=dev)
+        cmds1[:,0].clamp_(-vx_clamp, vx_clamp)
+        cmds1[:,1].clamp_(-0.25, 0.25)
+        cmds1[:,2].clamp_(-0.80, 0.80)
+        cmds2 = mean2 + std2 * torch.randn((n_candidates,3), device=dev)
+        cmds2[:,0].clamp_(0.0, 0.40)
+        cmds2[:,1].clamp_(-0.15, 0.15)
+        cmds2[:,2].clamp_(-0.75, 0.75)
 
         z_roll = z_current.expand(n_candidates, -1)
         h_t    = torch.zeros((n_candidates, jepa.latent_dim), device=dev, dtype=z_roll.dtype)
-        for _ in range(horizon):
-            z_roll, h_t = jepa.predictor(z_roll, cmds, h_t)
+        for t in range(horizon):
+            cmd_t = cmds1 if t < split else cmds2
+            z_roll, h_t = jepa.predictor(z_roll, cmd_t, h_t)
 
         eng = head(z_roll, z_goal.expand_as(z_roll))
 
-        paths_t, end_xy_t = rollout_cmds_batched_paths(robot_xy, robot_yaw, cmds, horizon)
-        _, end_yaw_t      = rollout_cmds_batched(robot_xy, robot_yaw, cmds, horizon)
+        paths_t, end_xy_t = rollout_cmds_batched_paths(
+            robot_xy, robot_yaw, cmds1, horizon, cmds2=cmds2, split=split)
+        _, end_yaw_t = rollout_cmds_batched(
+            robot_xy, robot_yaw, cmds1, horizon, cmds2=cmds2, split=split)
         coll_t     = path_collision_penalty_batched_torch(sm, paths_t, occ_grid)
         end_dist_t = (end_xy_t - goal_t).norm(dim=1)
         end_ang_t  = torch.atan2(goal_t[1]-end_xy_t[:,1], goal_t[0]-end_xy_t[:,0])
@@ -1393,29 +1420,28 @@ def plan_seek_cmd(
             energy_weight * eng
             + geo_cost
             + coll_t
-            + 0.45 * cmds[:, 1].abs()
-            + 0.06 * cmds[:, 2].abs()
+            + 0.45 * cmds1[:, 1].abs()
+            + 0.06 * cmds1[:, 2].abs()
         )
         if prev_cmd is not None:
-            cost = cost + 0.10*(cmds - prev_cmd).pow(2).sum(dim=-1)
+            cost = cost + 0.10*(cmds1 - prev_cmd).pow(2).sum(dim=-1)
 
-        # Depth-based penalties applied every CEM iteration so the mean
-        # converges toward obstacle-avoiding trajectories.
         if depth_fwd_scale > 0.01:
-            cost = cost + cmds[:, 0].clamp(min=0) * depth_fwd_scale * DEPTH_PEN_COEFF
+            cost = cost + cmds1[:, 0].clamp(min=0) * depth_fwd_scale * DEPTH_PEN_COEFF
         if abs(depth_turn_bias) > 0.05:
-            # Reward turning toward the open side (bias ↑ → prefer +wz)
-            cost = cost - depth_turn_bias * cmds[:, 2]
+            cost = cost - depth_turn_bias * cmds1[:, 2]
 
         k = max(n_candidates//10, 8)
         elite = torch.topk(cost, k=k, largest=False).indices
-        mean  = cmds[elite].mean(0)
-        std   = cmds[elite].std(0) + 1e-4
+        mean  = cmds1[elite].mean(0)
+        std   = cmds1[elite].std(0) + 1e-4
+        mean2 = cmds2[elite].mean(0)
+        std2  = cmds2[elite].std(0) + 1e-4
 
         ib = int(torch.argmin(cost).item())
         if best_cost is None or float(cost[ib]) < best_cost:
             best_cost = float(cost[ib])
-            best_cmd  = cmds[ib].view(1,3).detach().clone()
+            best_cmd  = cmds1[ib].view(1,3).detach().clone()
             best_path = paths_t[ib].detach().cpu().numpy()
 
     return best_cmd, best_path if best_path is not None else np.zeros((horizon,2), np.float32)
@@ -1465,6 +1491,16 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
             0.22 if far else 0.16,
         ], device=dev, dtype=torch.float32)
 
+    # Phase-2 mean: drive forward toward the goal after initial manoeuvre.
+    mean2 = torch.tensor([
+        clamp(ts * 1.2, 0.10, 0.36),
+        0.0,
+        clamp(0.40 * hdg_err, -0.55, 0.55),
+    ], device=dev, dtype=torch.float32)
+    std2 = torch.tensor([0.10, 0.03, 0.18], device=dev, dtype=torch.float32)
+
+    split = max(3, hz // 2)
+
     occ_grid = torch.as_tensor(sm.grid == MAP_OCC, device=dev)
     unknown_grid = torch.as_tensor(sm.grid == MAP_UNKNOWN, device=dev)
     visit_grid = torch.as_tensor(sm.free_visits, device=dev)
@@ -1477,21 +1513,28 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
     best_path = None
 
     for _ in range(4):
-        cmds = mean + std * torch.randn((cands, 3), device=dev)
-        cmds[:, 0].clamp_(0.0, 0.38)
-        cmds[:, 1].clamp_(-0.08, 0.08)
-        cmds[:, 2].clamp_(-0.75, 0.75)
+        cmds1 = mean + std * torch.randn((cands, 3), device=dev)
+        cmds1[:, 0].clamp_(0.0, 0.38)
+        cmds1[:, 1].clamp_(-0.08, 0.08)
+        cmds1[:, 2].clamp_(-0.75, 0.75)
+        cmds2 = mean2 + std2 * torch.randn((cands, 3), device=dev)
+        cmds2[:, 0].clamp_(0.0, 0.38)
+        cmds2[:, 1].clamp_(-0.08, 0.08)
+        cmds2[:, 2].clamp_(-0.75, 0.75)
 
         z_roll = zc.expand(cands, -1)
         h_t = torch.zeros((cands, jepa.latent_dim), device=dev, dtype=z_roll.dtype)
-        for _ in range(hz):
-            z_roll, h_t = jepa.predictor(z_roll, cmds, h_t)
+        for t in range(hz):
+            cmd_t = cmds1 if t < split else cmds2
+            z_roll, h_t = jepa.predictor(z_roll, cmd_t, h_t)
 
         latent_mag = z_roll.norm(dim=-1) / z_ref_norm
         novelty_t = latent_bank_novelty_torch(z_roll, latent_memory_norm)
 
-        paths_t, end_xy_t = rollout_cmds_batched_paths(robot_xy, robot_yaw, cmds, hz)
-        _, end_yaw_t = rollout_cmds_batched(robot_xy, robot_yaw, cmds, hz)
+        paths_t, end_xy_t = rollout_cmds_batched_paths(
+            robot_xy, robot_yaw, cmds1, hz, cmds2=cmds2, split=split)
+        _, end_yaw_t = rollout_cmds_batched(
+            robot_xy, robot_yaw, cmds1, hz, cmds2=cmds2, split=split)
 
         coll_t = path_collision_penalty_batched_torch(sm, paths_t, occ_grid)
         visit_t = path_visit_penalty_batched_torch(sm, paths_t, visit_grid)
@@ -1505,7 +1548,7 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
         latent_pen = (latent_mag - 1.5).clamp(min=0.0) * 0.15
         smooth_pen = (
             torch.zeros(cands, device=dev) if prev_cmd is None
-            else 0.10 * (cmds - prev_cmd).pow(2).sum(dim=-1)
+            else 0.10 * (cmds1 - prev_cmd).pow(2).sum(dim=-1)
         )
         stasis_pen = (0.16 - end_disp_t).clamp(min=0.0) * 2.5
         novelty_bonus = LATENT_NOVELTY_WEIGHT * novelty_t * progress_t.clamp(min=0.0, max=0.30)
@@ -1515,11 +1558,11 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
             + PATH_VISIT_PENALTY * visit_t
             + latent_pen
             + smooth_pen
-            + 1.10 * cmds[:, 1].abs()
-            + 0.10 * cmds[:, 2].abs()
+            + 1.10 * cmds1[:, 1].abs()
+            + 0.10 * cmds1[:, 2].abs()
             + 0.20 * end_herr_t
             + stasis_pen
-            + (cmds[:, 0] < 0.08).float() * 0.40
+            + (cmds1[:, 0] < 0.08).float() * 0.40
             - 3.40 * progress_t
             - 0.95 * frontier_t
             - novelty_bonus
@@ -1527,13 +1570,15 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
 
         elite_k = max(8, cands // 10)
         elite = torch.topk(cost, k=elite_k, largest=False).indices
-        mean = cmds[elite].mean(dim=0)
-        std = cmds[elite].std(dim=0) + 1e-4
+        mean = cmds1[elite].mean(dim=0)
+        std = cmds1[elite].std(dim=0) + 1e-4
+        mean2 = cmds2[elite].mean(dim=0)
+        std2 = cmds2[elite].std(dim=0) + 1e-4
 
         ib = int(torch.argmin(cost).item())
         if best_cost is None or float(cost[ib]) < best_cost:
             best_cost = float(cost[ib])
-            best_cmd = cmds[ib].detach().clone().view(1, 3)
+            best_cmd = cmds1[ib].detach().clone().view(1, 3)
             best_path = paths_t[ib].detach().cpu().numpy()
 
     return best_cmd, best_path if best_path is not None else np.zeros((hz, 2), np.float32)
