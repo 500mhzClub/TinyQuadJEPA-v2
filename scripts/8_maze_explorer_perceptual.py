@@ -93,7 +93,7 @@ GLIMPSE_CONFIRM_STEPS = 4
 DETECT_STRIDE         = 4
 GLIMPSE_COOLDOWN      = 45
 PROXY_ROUTE_RADIUS    = 0.45
-BREADCRUMB_YAW_OFFSETS_DEG = (-28.0, -12.0, 0.0, 12.0, 28.0)
+BREADCRUMB_YAW_OFFSETS_DEG = (-90.0, -55.0, -28.0, -12.0, 0.0, 12.0, 28.0, 55.0, 90.0)
 LATENT_MEMORY_MAX = 512
 LATENT_MEMORY_STRIDE = 4
 LATENT_MEMORY_MIN_STEP_DIST = 0.10
@@ -1946,34 +1946,9 @@ def main():
                 z_current, head, bc_lats, found, seeking_idx,
                 seek_timeout_cd, glimpse_timeout_cd, detect_streaks, glimpse_streaks,
             )
-            # Sanity-gate the detection:
-            # 1. Bearing gate — beacon must be within the camera FOV
-            # 2. Depth gate  — reject if there's a wall closer than the beacon
-            if detected is not None:
-                _dwp = waypoints[detected]
-                _d2b = float(np.linalg.norm(_dwp.pos - robot_xy))
-                _bear = math.atan2(float(_dwp.pos[1] - robot_xy[1]),
-                                   float(_dwp.pos[0] - robot_xy[0]))
-                _bear_delta = wrap_to_pi(_bear - robot_yaw)
-                _bear_err = abs(_bear_delta)
-                _half_fov = math.radians(BRAIN_CAM_FOV_DEG / 2 + 25.0)  # 25° tolerance — allow peripheral/latent detections
-                _bearing_stats = bearing_depth_stats(
-                    depth, _bear_delta, args.depth_max,
-                    cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
-                    fov_deg=BRAIN_CAM_FOV_DEG,
-                )
-                _hit_range = None if _bearing_stats is None else _bearing_stats["hit_range"]
-                _wall_blocking = (
-                    _hit_range is not None
-                    and _d2b > 1.0
-                    and float(_hit_range) + DETECT_WALL_MARGIN_M < _d2b
-                )
-                if _bear_err > _half_fov:
-                    print(f"  [DETECT-SKIP] {_dwp.name} bearing error={math.degrees(_bear_err):.0f}° > FOV")
-                    detected = None; detect_kind = None
-                elif _wall_blocking:
-                    print(f"  [DETECT-SKIP] {_dwp.name} wall blocks: dhit={float(_hit_range):.2f}m < d2b={_d2b:.2f}m")
-                    detected = None; detect_kind = None
+            # Energy-head detections are trusted — no bearing or depth gate.
+            # The JEPA latent space can detect beacons from peripheral views
+            # and non-line-of-sight contexts that geometric gates would reject.
         if detected is not None and seeking_idx < 0:
             detect_wp = waypoints[detected]
             seek_goal_xy = waypoint_seek_anchor(detect_wp)
