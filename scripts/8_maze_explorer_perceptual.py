@@ -1145,6 +1145,7 @@ def plan_seek_cmd(
     goal_body_xy, dist_to_goal, heading_error, n_candidates, horizon, dev,
     prev_cmd=None,
     energy_scale=1.0,
+    depth_sig=None,
 ):
     far = dist_to_goal > 0.9
     speed_scale = float(np.clip(dist_to_goal / 0.9, 0.2, 1.0))
@@ -1171,12 +1172,34 @@ def plan_seek_cmd(
     best_cmd  = mean.view(1,3)
     best_cost = None
     best_path = None
-    # energy_scale=0 when routing around a wall: the beacon latent is behind an
-    # obstacle, so JEPA energy is uniformly high for ALL candidates and just pulls
-    # the CEM toward the wall.  Pure geometry + coll_t handles routing instead.
     energy_weight = float(np.clip((dist_to_goal-0.35)/0.65, 0.0, 1.0)) * float(energy_scale)
     goal_t = torch.tensor(goal_xy, device=dev, dtype=torch.float32)
     occ_grid = torch.as_tensor(sm.grid == MAP_OCC, device=dev)
+
+    # Depth-based obstacle penalty: replaces BFS wall-avoidance.
+    # If the depth camera sees something close ahead, penalise forward motion
+    # in the CEM so the world model doesn't drive the robot into unmapped walls.
+    # Ramp from 0 at DEPTH_PEN_ONSET to full at DEPTH_PEN_FULL.
+    DEPTH_PEN_ONSET = 0.90   # metres — penalty starts
+    DEPTH_PEN_FULL  = 0.25   # metres — full penalty
+    DEPTH_PEN_COEFF = 9.0    # scales with vx; must exceed combined geo+energy pull
+    depth_fwd_scale = 0.0
+    depth_turn_bias = 0.0    # positive → prefer +wz (turn left / ccw)
+    if depth_sig is not None:
+        d_center = float(depth_sig[1])
+        depth_fwd_scale = float(np.clip(
+            (DEPTH_PEN_ONSET - d_center) / (DEPTH_PEN_ONSET - DEPTH_PEN_FULL),
+            0.0, 1.0,
+        ))
+        # Bias turning toward whichever side has more open space so the robot
+        # arcs around the obstacle rather than spinning in place.
+        d_left  = float(depth_sig[0])
+        d_right = float(depth_sig[2])
+        if depth_fwd_scale > 0.05 and abs(d_left - d_right) > 0.05:
+            # positive → left more open → prefer +wz; negative → right more open
+            depth_turn_bias = float(np.clip(
+                (d_left - d_right) / max(d_center, 0.1), -1.0, 1.0,
+            )) * depth_fwd_scale * 1.5
 
     for _ in range(5):
         cmds = mean + std * torch.randn((n_candidates,3), device=dev)
@@ -1208,6 +1231,14 @@ def plan_seek_cmd(
         )
         if prev_cmd is not None:
             cost = cost + 0.10*(cmds - prev_cmd).pow(2).sum(dim=-1)
+
+        # Depth-based penalties applied every CEM iteration so the mean
+        # converges toward obstacle-avoiding trajectories.
+        if depth_fwd_scale > 0.01:
+            cost = cost + cmds[:, 0].clamp(min=0) * depth_fwd_scale * DEPTH_PEN_COEFF
+        if abs(depth_turn_bias) > 0.05:
+            # Reward turning toward the open side (bias ↑ → prefer +wz)
+            cost = cost - depth_turn_bias * cmds[:, 2]
 
         k = max(n_candidates//10, 8)
         elite = torch.topk(cost, k=k, largest=False).indices
@@ -1869,29 +1900,14 @@ def main():
         elif guard_steps > 0:
             cmd = guard_cmd; guard_steps -= 1; plan_path = None
         elif seeking_idx >= 0:
-            # Goal-directed: BFS detours only around *known* walls; JEPA CEM
-            # handles the rest (arcing around corners, unknown space, etc.).
+            # Goal-directed: JEPA energy + depth-based obstacle avoidance.
+            # No BFS — the world model guides direction; the depth penalty
+            # in plan_seek_cmd stops the robot from driving into walls the
+            # camera sees but that may not yet be in the occupancy map.
             wp    = waypoints[seeking_idx]
             seek_goal_xy = waypoint_seek_anchor(wp)
-            gvec  = seek_goal_xy - robot_xy
-            gdist = float(np.linalg.norm(gvec))
-
-            # allow_unknown=True so unexplored space is treated as passable;
-            # only a confirmed MAP_OCC cell triggers a BFS detour.
-            direct_clear = _frontier_reachable(sm, robot_xy, seek_goal_xy, allow_unknown=True)
-            if not direct_clear:
-                bfs_tgt = bfs_next_waypoint(
-                    sm, robot_xy, seek_goal_xy,
-                    lookahead_m=0.7, allow_unknown=True, snap_goal_to_free=False,
-                )
-                seek_nav = bfs_tgt if bfs_tgt is not None else seek_goal_xy
-                # Beacon latent is behind a wall: all rollouts are far from it so
-                # JEPA energy is uniformly high and just pulls CEM into the wall.
-                # Zero it out — BFS geometry + coll_t handle routing instead.
-                energy_scale = 0.0
-            else:
-                seek_nav = seek_goal_xy
-                energy_scale = 1.0  # direct view — JEPA energy is informative
+            seek_nav = seek_goal_xy
+            energy_scale = 1.0
 
             navvec  = seek_nav - robot_xy
             navdist = float(np.linalg.norm(navvec))
@@ -1904,6 +1920,7 @@ def main():
                 robot_xy, robot_yaw, seek_nav, gbody,
                 navdist, herr, args.cands, args.horizon, dev, prev_cmd,
                 energy_scale=energy_scale,
+                depth_sig=depth_sig,
             )
             prev_cmd = cmd.clone()
         else:
@@ -2130,8 +2147,7 @@ def main():
             if guard_steps > 0:
                 mode_dbg = f"GUARD({guard_steps})"
             elif seeking_idx >= 0:
-                _e_tag = "" if energy_scale > 0.0 else "/bfs"
-                mode_dbg = f"SEEK{_e_tag}:{waypoints[seeking_idx].name}"
+                mode_dbg = f"SEEK:{waypoints[seeking_idx].name}"
             else:
                 hdg_to_f = wrap_to_pi(
                     math.atan2(float(frontier_xy[1]-robot_xy[1]),
