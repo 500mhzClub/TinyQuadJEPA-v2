@@ -1445,9 +1445,9 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
 
     hdg_err = wrap_to_pi(math.atan2(float(goal_vec[1]), float(goal_vec[0])) - robot_yaw)
     far = goal_dist > 0.8
-    ts = (0.28 if far else 0.18) * float(np.clip(goal_dist / 0.9, 0.25, 1.0))
-    if abs(hdg_err) > 0.70:
-        ts *= 0.45
+    ts = (0.32 if far else 0.22) * float(np.clip(goal_dist / 0.9, 0.35, 1.0))
+    if abs(hdg_err) > 0.90:
+        ts *= 0.55
 
     if abs(hdg_err) > math.pi * 0.55:
         mean = torch.tensor([0.0, 0.0, math.copysign(0.70, hdg_err)],
@@ -1507,7 +1507,7 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
             torch.zeros(cands, device=dev) if prev_cmd is None
             else 0.10 * (cmds - prev_cmd).pow(2).sum(dim=-1)
         )
-        stasis_pen = (0.14 - end_disp_t).clamp(min=0.0) * 1.8
+        stasis_pen = (0.16 - end_disp_t).clamp(min=0.0) * 2.5
         novelty_bonus = LATENT_NOVELTY_WEIGHT * novelty_t * progress_t.clamp(min=0.0, max=0.30)
 
         cost = (
@@ -1519,7 +1519,7 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
             + 0.10 * cmds[:, 2].abs()
             + 0.20 * end_herr_t
             + stasis_pen
-            + (cmds[:, 0] < 0.06).float() * 0.28
+            + (cmds[:, 0] < 0.08).float() * 0.40
             - 3.40 * progress_t
             - 0.95 * frontier_t
             - novelty_bonus
@@ -1855,7 +1855,7 @@ def main():
     frontier_xy       = np.array([0.5, 0.5], np.float32)
     frontier_age      = 0
     cov_start         = 0.0
-    FRONTIER_PATIENCE = 120
+    FRONTIER_PATIENCE = 200
     frontier_bl:      List[np.ndarray] = []
     frontier_switches = 0
     guard_mode        = "none"
@@ -2235,7 +2235,7 @@ def main():
                     new_f = find_far_unknown(sm, robot_xy)
                     frontier_bl = frontier_bl[-4:]
 
-            if float(np.linalg.norm(new_f - frontier_xy)) > 0.18 or force_new:
+            if float(np.linalg.norm(new_f - frontier_xy)) > 0.50 or force_new:
                 frontier_switches += 1
                 frontier_xy = new_f; frontier_age = 0; cov_start = cov
 
@@ -2256,7 +2256,7 @@ def main():
                 if len(recent_pos) >= recent_pos.maxlen else 1.0)
         if stuck_cooldown > 0:
             stuck_cooldown -= 1
-        if guard_steps <= 0 and stuck_cooldown <= 0 and disp < 0.12 and seeking_idx < 0:
+        if guard_steps <= 0 and stuck_cooldown <= 0 and disp < 0.08 and seeking_idx < 0:
             stuck_count += 1
             frontier_bl.append(frontier_xy.copy())
             if stuck_count >= 3:
