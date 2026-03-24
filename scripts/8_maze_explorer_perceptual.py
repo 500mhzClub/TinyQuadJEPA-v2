@@ -136,6 +136,9 @@ LOG_ODDS_MIN           = -24
 LOG_ODDS_MAX           = 24
 LOG_ODDS_OCC_THRESH    = 6
 LOG_ODDS_FREE_THRESH   = -2
+OCC_HIT_CLUSTER_EPS_M  = 0.10
+OCC_HIT_MIN_ROWS       = 3
+OCC_HIT_MIN_FRAC       = 0.16
 UNKNOWN_TRAVERSE_COST  = 2.6
 VISIT_TRAVERSE_COST    = 0.10
 PATH_VISIT_PENALTY     = 0.18
@@ -558,10 +561,15 @@ def robust_depth_column_distance(ray, depth_max):
 
     hits = valid[(valid >= MIN_OCC_DEPTH) & (valid < depth_max * 0.985)]
     if hits.size > 0:
-        hit_dist = float(clamp(float(np.nanpercentile(hits, 20)), MIN_OCC_DEPTH, depth_max))
-        return hit_dist, hit_dist
+        nearest = np.sort(hits)
+        cluster_hi = float(nearest[0]) + OCC_HIT_CLUSTER_EPS_M
+        cluster = nearest[nearest <= cluster_hi]
+        min_cluster = max(OCC_HIT_MIN_ROWS, int(math.ceil(OCC_HIT_MIN_FRAC * float(valid.size))))
+        if cluster.size >= min_cluster:
+            hit_dist = float(clamp(float(np.nanmedian(cluster)), MIN_OCC_DEPTH, depth_max))
+            return hit_dist, hit_dist
 
-    clear_dist = float(clamp(float(np.nanpercentile(valid, 70)), 0.05, depth_max))
+    clear_dist = float(clamp(float(np.nanpercentile(valid, 60)), 0.05, depth_max))
     return clear_dist, None
 
 
@@ -1381,33 +1389,33 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
         nudge = torch.tensor([[0.16, 0.0, 0.45]], device=dev, dtype=torch.float32)
         return nudge, np.zeros((hz, 2), np.float32)
 
-    goal_body_xy = world_to_body_xy(robot_yaw, goal_vec / max(goal_dist, 1e-8))
     hdg_err = wrap_to_pi(math.atan2(float(goal_vec[1]), float(goal_vec[0])) - robot_yaw)
     far = goal_dist > 0.8
-    transl_scale = 0.30 if far else 0.20
-    if abs(hdg_err) > 0.9:
-        transl_scale *= 0.50
+    ts = (0.28 if far else 0.18) * float(np.clip(goal_dist / 0.9, 0.25, 1.0))
+    if abs(hdg_err) > 0.70:
+        ts *= 0.45
 
     if abs(hdg_err) > math.pi * 0.55:
         mean = torch.tensor([0.0, 0.0, math.copysign(0.70, hdg_err)],
                             device=dev, dtype=torch.float32)
-        std = torch.tensor([0.05, 0.04, 0.14], device=dev, dtype=torch.float32)
+        std = torch.tensor([0.04, 0.025, 0.12], device=dev, dtype=torch.float32)
     else:
         mean = torch.tensor([
-            clamp(float(goal_body_xy[0]) * transl_scale, 0.0, 0.36),
-            clamp(float(goal_body_xy[1]) * 0.10, -0.10, 0.10),
-            clamp(0.55 * hdg_err, -0.72, 0.72),
+            clamp(ts, 0.0, 0.36),
+            0.0,
+            clamp(0.60 * hdg_err, -0.72, 0.72),
         ], device=dev, dtype=torch.float32)
         std = torch.tensor([
-            0.13 if far else 0.09,
-            0.08 if far else 0.06,
-            0.24 if far else 0.18,
+            0.10 if far else 0.07,
+            0.035 if far else 0.025,
+            0.22 if far else 0.16,
         ], device=dev, dtype=torch.float32)
 
     occ_grid = torch.as_tensor(sm.grid == MAP_OCC, device=dev)
     unknown_grid = torch.as_tensor(sm.grid == MAP_UNKNOWN, device=dev)
     visit_grid = torch.as_tensor(sm.free_visits, device=dev)
     goal_t = torch.tensor(frontier_xy, device=dev, dtype=torch.float32)
+    robot_xy_t = torch.tensor(robot_xy, device=dev, dtype=torch.float32)
     z_ref_norm = float(zc.norm(dim=-1).mean().item()) + 1e-6
 
     best_cmd = mean.view(1, 3)
@@ -1417,7 +1425,7 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
     for _ in range(4):
         cmds = mean + std * torch.randn((cands, 3), device=dev)
         cmds[:, 0].clamp_(0.0, 0.38)
-        cmds[:, 1].clamp_(-0.12, 0.12)
+        cmds[:, 1].clamp_(-0.08, 0.08)
         cmds[:, 2].clamp_(-0.75, 0.75)
 
         z_roll = zc.expand(cands, -1)
@@ -1435,6 +1443,7 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
         visit_t = path_visit_penalty_batched_torch(sm, paths_t, visit_grid)
         frontier_t = local_unknown_gain_batched_torch(sm, end_xy_t, unknown_grid, radius=0.60)
         end_dist_t = (end_xy_t - goal_t).norm(dim=1)
+        end_disp_t = (end_xy_t - robot_xy_t).norm(dim=1)
         progress_t = goal_dist - end_dist_t
         end_ang_t = torch.atan2(goal_t[1] - end_xy_t[:, 1], goal_t[0] - end_xy_t[:, 0])
         end_herr_t = ((end_ang_t - end_yaw_t + math.pi) % (2 * math.pi) - math.pi).abs()
@@ -1444,17 +1453,20 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
             torch.zeros(cands, device=dev) if prev_cmd is None
             else 0.10 * (cmds - prev_cmd).pow(2).sum(dim=-1)
         )
-        novelty_bonus = LATENT_NOVELTY_WEIGHT * novelty_t
+        stasis_pen = (0.14 - end_disp_t).clamp(min=0.0) * 1.8
+        novelty_bonus = LATENT_NOVELTY_WEIGHT * novelty_t * progress_t.clamp(min=0.0, max=0.30)
 
         cost = (
             coll_t
             + PATH_VISIT_PENALTY * visit_t
             + latent_pen
             + smooth_pen
-            + 0.45 * cmds[:, 1].abs()
+            + 1.10 * cmds[:, 1].abs()
+            + 0.10 * cmds[:, 2].abs()
             + 0.20 * end_herr_t
-            + (cmds[:, 0] < 0.03).float() * 0.10
-            - 3.20 * progress_t
+            + stasis_pen
+            + (cmds[:, 0] < 0.06).float() * 0.28
+            - 3.40 * progress_t
             - 0.95 * frontier_t
             - novelty_bonus
         )
