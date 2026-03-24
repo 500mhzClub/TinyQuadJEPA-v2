@@ -1144,6 +1144,7 @@ def plan_seek_cmd(
     jepa, head, z_current, z_goal, sm, robot_xy, robot_yaw, goal_xy,
     goal_body_xy, dist_to_goal, heading_error, n_candidates, horizon, dev,
     prev_cmd=None,
+    energy_scale=1.0,
 ):
     far = dist_to_goal > 0.9
     speed_scale = float(np.clip(dist_to_goal / 0.9, 0.2, 1.0))
@@ -1170,7 +1171,10 @@ def plan_seek_cmd(
     best_cmd  = mean.view(1,3)
     best_cost = None
     best_path = None
-    energy_weight = float(np.clip((dist_to_goal-0.35)/0.65, 0.0, 1.0))
+    # energy_scale=0 when routing around a wall: the beacon latent is behind an
+    # obstacle, so JEPA energy is uniformly high for ALL candidates and just pulls
+    # the CEM toward the wall.  Pure geometry + coll_t handles routing instead.
+    energy_weight = float(np.clip((dist_to_goal-0.35)/0.65, 0.0, 1.0)) * float(energy_scale)
     goal_t = torch.tensor(goal_xy, device=dev, dtype=torch.float32)
     occ_grid = torch.as_tensor(sm.grid == MAP_OCC, device=dev)
 
@@ -1858,6 +1862,7 @@ def main():
                 ))
 
         # ── Command selection ──────────────────────────────────────────── #
+        energy_scale = 1.0  # updated inside seek branch; readable by log line
         if clip_retreat_steps > 0:
             cmd = torch.tensor([[-0.25, 0.0, 0.0]], device=dev, dtype=torch.float32)
             clip_retreat_steps -= 1; plan_path = None
@@ -1873,14 +1878,20 @@ def main():
 
             # allow_unknown=True so unexplored space is treated as passable;
             # only a confirmed MAP_OCC cell triggers a BFS detour.
-            if not _frontier_reachable(sm, robot_xy, seek_goal_xy, allow_unknown=True):
+            direct_clear = _frontier_reachable(sm, robot_xy, seek_goal_xy, allow_unknown=True)
+            if not direct_clear:
                 bfs_tgt = bfs_next_waypoint(
                     sm, robot_xy, seek_goal_xy,
                     lookahead_m=0.7, allow_unknown=True, snap_goal_to_free=False,
                 )
                 seek_nav = bfs_tgt if bfs_tgt is not None else seek_goal_xy
+                # Beacon latent is behind a wall: all rollouts are far from it so
+                # JEPA energy is uniformly high and just pulls CEM into the wall.
+                # Zero it out — BFS geometry + coll_t handle routing instead.
+                energy_scale = 0.0
             else:
                 seek_nav = seek_goal_xy
+                energy_scale = 1.0  # direct view — JEPA energy is informative
 
             navvec  = seek_nav - robot_xy
             navdist = float(np.linalg.norm(navvec))
@@ -1892,6 +1903,7 @@ def main():
                 jepa, head, z_current, z_goal, sm,
                 robot_xy, robot_yaw, seek_nav, gbody,
                 navdist, herr, args.cands, args.horizon, dev, prev_cmd,
+                energy_scale=energy_scale,
             )
             prev_cmd = cmd.clone()
         else:
@@ -2118,7 +2130,8 @@ def main():
             if guard_steps > 0:
                 mode_dbg = f"GUARD({guard_steps})"
             elif seeking_idx >= 0:
-                mode_dbg = f"SEEK:{waypoints[seeking_idx].name}"
+                _e_tag = "" if energy_scale > 0.0 else "/bfs"
+                mode_dbg = f"SEEK{_e_tag}:{waypoints[seeking_idx].name}"
             else:
                 hdg_to_f = wrap_to_pi(
                     math.atan2(float(frontier_xy[1]-robot_xy[1]),
