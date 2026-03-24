@@ -16,8 +16,8 @@ Occupied-hit updates are restricted to the upper ~66 % of the depth image
 (rows that correspond to roughly horizontal or upward gaze) to suppress
 ground-return false positives that appear in the downward-facing lower rows.
 
-Everything else — JEPA encoding, energy-head beacon detection, CEM planning,
-breadcrumb harvesting — is identical to 7_maze_explorer.py.
+Beacon recognition uses canonical reference panels rendered in a separate scene,
+so the explorer does not preload the hidden maze layout before the run.
 
 Usage:
     python scripts/8_maze_explorer_perceptual.py \\
@@ -82,18 +82,29 @@ ROBOT_SPAWN = (0.5, -0.5, 0.12)
 # Detection thresholds
 DETECT_DIST  = 2.2   # metres
 DETECT_FOV   = 0.90  # radians half-angle (~52°)
-ARRIVE_DIST  = 0.45  # metres — waypoint claimed
+ARRIVE_DIST  = 0.55  # metres — waypoint claimed
 MAX_SEEK_STEPS = 2200
 DETECT_ENERGY_THRESH  = -1.20
 DETECT_ENERGY_MARGIN  = 0.50
-DETECT_CONFIRM_STEPS  = 8
+DETECT_CONFIRM_STEPS  = 5
 GLIMPSE_ENERGY_THRESH = -0.55
 GLIMPSE_ENERGY_MARGIN = 0.15
-GLIMPSE_CONFIRM_STEPS = 4
+GLIMPSE_CONFIRM_STEPS = 2
 DETECT_STRIDE         = 4
-GLIMPSE_COOLDOWN      = 45
-PROXY_ROUTE_RADIUS    = 0.45
+GLIMPSE_COOLDOWN      = 30
 BREADCRUMB_YAW_OFFSETS_DEG = (-90.0, -55.0, -28.0, -12.0, 0.0, 12.0, 28.0, 55.0, 90.0)
+REFERENCE_PANEL_X = 1.25
+REFERENCE_PANEL_SPACING = 1.60
+VISIBLE_COLOR_DIST_THRESH = 0.30
+VISIBLE_MIN_PIXELS = 8
+VISIBLE_STRONG_PIXELS = 14
+VISIBLE_MIN_BBOX_HEIGHT = 4
+VISIBLE_MIN_DENSITY = 0.30
+VISIBLE_MIN_BRIGHTNESS = 0.22
+VISIBLE_MIN_SATURATION = 0.18
+VISIBLE_ROW_LO_FRAC = 0.04
+VISIBLE_ROW_HI_FRAC = 0.92
+BEACON_ACTIONABLE_DEPTH = 1.60
 LATENT_MEMORY_MAX = 512
 LATENT_MEMORY_STRIDE = 4
 LATENT_MEMORY_MIN_STEP_DIST = 0.10
@@ -126,13 +137,18 @@ SEEK_ANCHOR_OFFSET     = 0.35
 SEEK_STALL_WINDOW      = 55
 SEEK_STALL_DISP        = 0.05
 SEEK_STALL_PROGRESS    = 0.03
-SEEK_STALL_DEPTH_DELTA = 0.05
 SEEK_RECOVERY_COOLDOWN = 30
 SEEK_PROGRESS_RESET    = 0.10
 LINE_CHECK_STEP_M      = 0.05
 DETECTION_CLEARANCE_RADIUS = 0.08
-DETECTION_SCORE_DIST_W = 0.35
-DETECTION_SEEK_MAX_DIST = 3.20
+LONG_STALL_WINDOW = 220
+LONG_STALL_RADIUS = 0.18
+LONG_STALL_COV_GAIN = 0.60
+LONG_STALL_SEEK_PROGRESS = 0.18
+EXPLORE_FRONTIER_MIN_DIST = 0.30
+EXPLORE_FRONTIER_MAX_DIST = 1.75
+EXPLORE_FRONTIER_TOP_K = 24
+EXPLORE_FRONTIER_TEMP = 0.45
 FREE_LOG_ODDS_DEC      = 2
 OCC_LOG_ODDS_INC       = 2
 LOG_ODDS_MIN           = -24
@@ -217,6 +233,23 @@ def make_maze_waypoints() -> List[MazeWaypoint]:
     ]
 
 
+def make_reference_waypoints(waypoints: List[MazeWaypoint]) -> List[MazeWaypoint]:
+    refs: List[MazeWaypoint] = []
+    y0 = -0.5 * REFERENCE_PANEL_SPACING * float(len(waypoints) - 1)
+    for i, wp in enumerate(waypoints):
+        y = y0 + REFERENCE_PANEL_SPACING * float(i)
+        pos = np.array([REFERENCE_PANEL_X, y], dtype=np.float32)
+        refs.append(MazeWaypoint(
+            name=wp.name,
+            pos=pos,
+            approach_dir=np.array([1.0, 0.0], dtype=np.float32),
+            panel_pos=(REFERENCE_PANEL_X + 0.55, y, 0.55),
+            panel_size=(0.12, 0.9, 1.1),
+            color_rgb=wp.color_rgb,
+        ))
+    return refs
+
+
 # --------------------------------------------------------------------------- #
 # Scene construction
 # --------------------------------------------------------------------------- #
@@ -264,6 +297,42 @@ def build_scene(waypoints: List[MazeWaypoint]):
     robot.set_dofs_kv(torch.ones(12, device=gs.device) * 0.5, dofs)
 
     return scene, robot, cam_brain, cam_eye, cam_over, dofs, q0
+
+
+def build_reference_scene(reference_waypoints: List[MazeWaypoint]):
+    scene = gs.Scene(show_viewer=False)
+
+    tex = make_checkerboard(grid=12, path="maze_reference_checker.png")
+    scene.add_entity(
+        gs.morphs.Plane(),
+        surface=gs.surfaces.Rough(
+            diffuse_texture=gs.textures.ImageTexture(image_path=tex),
+        ),
+    )
+
+    robot = scene.add_entity(
+        gs.morphs.URDF(file=URDF_PATH, pos=ROBOT_SPAWN, fixed=False),
+    )
+
+    for wp in reference_waypoints:
+        scene.add_entity(
+            gs.morphs.Box(pos=wp.panel_pos, size=wp.panel_size, fixed=True),
+            surface=gs.surfaces.Rough(color=wp.color_rgb),
+        )
+
+    cam_brain = scene.add_camera(res=(64, 64), fov=BRAIN_CAM_FOV_DEG)
+    scene.build()
+
+    dofs = [robot.get_joint(jn).dofs_idx_local[0] for jn in JOINTS_ACTUATED]
+    q0   = torch.tensor(Q0_VALUES, device=gs.device, dtype=torch.float32)
+
+    robot.set_pos(np.array(ROBOT_SPAWN, dtype=np.float32))
+    robot.set_quat(yaw_to_quat(0.0))
+    robot.set_dofs_position(Q0_VALUES, dofs)
+    robot.set_dofs_kp(torch.ones(12, device=gs.device) * 5.0, dofs)
+    robot.set_dofs_kv(torch.ones(12, device=gs.device) * 0.5, dofs)
+
+    return scene, robot, cam_brain, dofs, q0
 
 
 # --------------------------------------------------------------------------- #
@@ -981,6 +1050,64 @@ def select_frontier(sm, robot_xy, blacklist=None, bl_radius=0.40):
     return cands[0][1], cands[0][0]
 
 
+def select_explore_frontier(sm, robot_xy, blacklist=None, bl_radius=0.40):
+    """Sample a reachable local frontier instead of fixating on one global optimum."""
+    bl = blacklist or []
+    local: List[Tuple[float, np.ndarray]] = []
+    global_cands: List[Tuple[float, np.ndarray]] = []
+
+    for r in range(1, sm.h - 1):
+        for c in range(1, sm.w - 1):
+            if sm.grid[r, c] != MAP_FREE:
+                continue
+            unk = sum(
+                1 for rr in range(r - 1, r + 2) for cc in range(c - 1, c + 2)
+                if not (rr == r and cc == c) and sm.grid[rr, cc] == MAP_UNKNOWN
+            )
+            if not unk:
+                continue
+            occ = sum(
+                1 for rr in range(r - 1, r + 2) for cc in range(c - 1, c + 2)
+                if not (rr == r and cc == c) and sm.grid[rr, cc] == MAP_OCC
+            )
+            wp = grid_to_world(sm, (r, c))
+            dist = float(np.linalg.norm(wp - robot_xy))
+            if dist < EXPLORE_FRONTIER_MIN_DIST:
+                continue
+            if any(float(np.linalg.norm(wp - bp)) < bl_radius for bp in bl):
+                continue
+
+            direct = _frontier_reachable(sm, robot_xy, wp)
+            via_bfs = bfs_next_waypoint(sm, robot_xy, wp) is not None
+            if not (direct or via_bfs):
+                continue
+
+            visit_pen = min(FRONTIER_VISIT_PENALTY * local_visit_score(sm, (r, c)), 1.8)
+            score = (
+                0.55 * float(unk)
+                - 0.22 * dist
+                - 0.35 * float(occ)
+                - visit_pen
+                + (1.4 if direct else 0.6)
+            )
+            global_cands.append((score, wp))
+            if dist <= EXPLORE_FRONTIER_MAX_DIST:
+                local.append((score, wp))
+
+    pool = local if local else global_cands
+    if not pool:
+        return select_frontier(sm, robot_xy, blacklist=blacklist, bl_radius=bl_radius)
+
+    pool.sort(key=lambda x: x[0], reverse=True)
+    top = pool[:min(EXPLORE_FRONTIER_TOP_K, len(pool))]
+    scores = np.asarray([s for s, _ in top], dtype=np.float32)
+    logits = (scores - scores.max()) / max(EXPLORE_FRONTIER_TEMP, 1e-3)
+    probs = np.exp(logits)
+    probs /= probs.sum()
+    choice = int(np.random.choice(len(top), p=probs))
+    return top[choice][1], float(scores[choice])
+
+
 def find_far_unknown(sm, robot_xy, min_dist=0.35):
     best_d = 0.0
     best_wp = robot_xy.copy()
@@ -1366,6 +1493,98 @@ def harvest_explore_reference(
 
 
 # --------------------------------------------------------------------------- #
+# Beacon visibility proposals
+# --------------------------------------------------------------------------- #
+
+def detect_visible_beacons(
+    rgb_img: np.ndarray,
+    depth_img: Optional[np.ndarray],
+    depth_max: float,
+    waypoints: List[MazeWaypoint],
+    *,
+    cam_pitch_rad=None,
+    cam_height_m=None,
+    fov_deg=BRAIN_CAM_FOV_DEG,
+) -> Dict[int, dict]:
+    rgb = np.asarray(rgb_img, dtype=np.float32)
+    if rgb.ndim != 3 or rgb.shape[-1] < 3:
+        return {}
+    if rgb.max() > 1.5:
+        rgb = rgb / 255.0
+    rgb = np.clip(rgb[..., :3], 0.0, 1.0)
+
+    h, w = rgb.shape[:2]
+    row_lo, row_hi = floor_safe_row_bounds(
+        h,
+        VISIBLE_ROW_LO_FRAC,
+        VISIBLE_ROW_HI_FRAC,
+        depth_max,
+        cam_pitch_rad=cam_pitch_rad,
+        cam_height_m=cam_height_m,
+        fov_deg=fov_deg,
+        floor_margin_frac=DEPTH_GUARD_FLOOR_MARGIN_FRAC,
+    )
+    crop = rgb[row_lo:row_hi]
+    if crop.size == 0:
+        return {}
+
+    prototypes = np.asarray([wp.color_rgb for wp in waypoints], dtype=np.float32)
+    diff = np.linalg.norm(crop[:, :, None, :] - prototypes[None, None, :, :], axis=-1)
+    best_idx = diff.argmin(axis=-1)
+    best_dist = diff.min(axis=-1)
+    brightness = crop.max(axis=-1)
+    saturation = crop.max(axis=-1) - crop.min(axis=-1)
+
+    depth_norm = normalize_depth_image(depth_img, depth_max)
+    detections: Dict[int, dict] = {}
+
+    for i in range(len(waypoints)):
+        mask = (
+            (best_idx == i)
+            & (best_dist <= VISIBLE_COLOR_DIST_THRESH)
+            & (brightness >= VISIBLE_MIN_BRIGHTNESS)
+            & (saturation >= VISIBLE_MIN_SATURATION)
+        )
+        n_pix = int(mask.sum())
+        if n_pix < VISIBLE_MIN_PIXELS:
+            continue
+
+        rr, cc = np.where(mask)
+        bbox_h = int(rr.max() - rr.min() + 1)
+        bbox_w = int(cc.max() - cc.min() + 1)
+        density = float(n_pix) / float(max(1, bbox_h * bbox_w))
+        if bbox_h < VISIBLE_MIN_BBOX_HEIGHT or density < VISIBLE_MIN_DENSITY:
+            continue
+
+        col_center = float(np.mean(cc))
+        x_norm = (col_center / max(float(w - 1), 1.0)) * 2.0 - 1.0
+        bearing = math.radians(0.5 * fov_deg) * x_norm
+
+        depth_m = None
+        if depth_norm is not None:
+            r0 = max(0, row_lo + int(rr.min()) - 1)
+            r1 = min(depth_norm.shape[0], row_lo + int(rr.max()) + 2)
+            c0 = max(0, int(cc.min()) - 1)
+            c1 = min(depth_norm.shape[1], int(cc.max()) + 2)
+            patch = depth_norm[r0:r1, c0:c1]
+            valid = patch[(patch >= MIN_OCC_DEPTH) & (patch < depth_max * 0.985)]
+            if valid.size >= 4:
+                depth_m = float(np.nanpercentile(valid, 35))
+
+        detections[i] = {
+            "pixels": n_pix,
+            "density": density,
+            "bearing_rad": bearing,
+            "depth_m": depth_m,
+            "bbox_h": bbox_h,
+            "bbox_w": bbox_w,
+            "visual_score": float(n_pix) * density,
+        }
+
+    return detections
+
+
+# --------------------------------------------------------------------------- #
 # Goal-directed planner
 # --------------------------------------------------------------------------- #
 
@@ -1390,12 +1609,12 @@ def plan_seek_cmd(
         if abs(heading_error) > 0.65: ts *= 0.35
         mean = torch.tensor([
             clamp(float(goal_body_xy[0])*ts, -0.35, 0.35),
-            clamp(float(goal_body_xy[1])*ts, -0.20, 0.20),
+            clamp(float(goal_body_xy[1])*ts, -0.12, 0.12),
             clamp(0.65*heading_error, -0.72, 0.72),
         ], device=dev, dtype=torch.float32)
         std = torch.tensor([
             (0.12 if far else 0.09)*speed_scale,
-            (0.10 if far else 0.08)*speed_scale,
+            (0.05 if far else 0.04)*speed_scale,
             0.22 if far else 0.18,
         ], device=dev, dtype=torch.float32)
 
@@ -1405,7 +1624,7 @@ def plan_seek_cmd(
         0.0,
         clamp(0.40 * heading_error, -0.55, 0.55),
     ], device=dev, dtype=torch.float32)
-    std2 = torch.tensor([0.10, 0.04, 0.20], device=dev, dtype=torch.float32)
+    std2 = torch.tensor([0.10, 0.03, 0.20], device=dev, dtype=torch.float32)
 
     split = max(3, horizon // 2)
 
@@ -1438,11 +1657,11 @@ def plan_seek_cmd(
     for _ in range(5):
         cmds1 = mean + std * torch.randn((n_candidates,3), device=dev)
         cmds1[:,0].clamp_(0.0, vx_clamp)
-        cmds1[:,1].clamp_(-0.25, 0.25)
+        cmds1[:,1].clamp_(-0.12, 0.12)
         cmds1[:,2].clamp_(-0.80, 0.80)
         cmds2 = mean2 + std2 * torch.randn((n_candidates,3), device=dev)
         cmds2[:,0].clamp_(0.0, 0.40)
-        cmds2[:,1].clamp_(-0.15, 0.15)
+        cmds2[:,1].clamp_(-0.08, 0.08)
         cmds2[:,2].clamp_(-0.75, 0.75)
 
         z_roll = z_current.expand(n_candidates, -1)
@@ -1467,7 +1686,7 @@ def plan_seek_cmd(
             energy_weight * eng
             + geo_cost
             + coll_t
-            + 0.45 * cmds1[:, 1].abs()
+            + 0.75 * cmds1[:, 1].abs()
             + 0.06 * cmds1[:, 2].abs()
         )
         if prev_cmd is not None:
@@ -1509,7 +1728,7 @@ def _kin_path(start_xy, start_yaw, cmd, horizon, dt=0.10):
 
 @torch.no_grad()
 def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, frontier_xy,
-                     prev_cmd, cands, hz, dev):
+                     prev_cmd, cands, hz, dev, depth_sig=None):
     goal_vec  = frontier_xy - robot_xy
     goal_dist = float(np.linalg.norm(goal_vec))
     if goal_dist < 1e-6:
@@ -1544,7 +1763,7 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
         0.0,
         clamp(0.40 * hdg_err, -0.55, 0.55),
     ], device=dev, dtype=torch.float32)
-    std2 = torch.tensor([0.10, 0.03, 0.18], device=dev, dtype=torch.float32)
+    std2 = torch.tensor([0.10, 0.02, 0.18], device=dev, dtype=torch.float32)
 
     split = max(3, hz // 2)
 
@@ -1555,6 +1774,21 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
     robot_xy_t = torch.tensor(robot_xy, device=dev, dtype=torch.float32)
     z_ref_norm = float(zc.norm(dim=-1).mean().item()) + 1e-6
 
+    depth_fwd_scale = 0.0
+    depth_turn_bias = 0.0
+    if depth_sig is not None:
+        d_center = float(depth_sig[1])
+        depth_fwd_scale = float(np.clip(
+            (0.60 - d_center) / (0.60 - 0.28),
+            0.0, 1.0,
+        ))
+        d_left = float(depth_sig[0])
+        d_right = float(depth_sig[2])
+        if depth_fwd_scale > 0.05 and abs(d_left - d_right) > 0.05:
+            depth_turn_bias = float(np.clip(
+                (d_left - d_right) / max(d_center, 0.1), -1.0, 1.0,
+            )) * depth_fwd_scale * 1.2
+
     best_cmd = mean.view(1, 3)
     best_cost = None
     best_path = None
@@ -1562,11 +1796,11 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
     for _ in range(4):
         cmds1 = mean + std * torch.randn((cands, 3), device=dev)
         cmds1[:, 0].clamp_(0.0, 0.38)
-        cmds1[:, 1].clamp_(-0.08, 0.08)
+        cmds1[:, 1].clamp_(-0.05, 0.05)
         cmds1[:, 2].clamp_(-0.75, 0.75)
         cmds2 = mean2 + std2 * torch.randn((cands, 3), device=dev)
         cmds2[:, 0].clamp_(0.0, 0.38)
-        cmds2[:, 1].clamp_(-0.08, 0.08)
+        cmds2[:, 1].clamp_(-0.04, 0.04)
         cmds2[:, 2].clamp_(-0.75, 0.75)
 
         z_roll = zc.expand(cands, -1)
@@ -1605,7 +1839,7 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
             + PATH_VISIT_PENALTY * visit_t
             + latent_pen
             + smooth_pen
-            + 1.10 * cmds1[:, 1].abs()
+            + 1.45 * cmds1[:, 1].abs()
             + 0.10 * cmds1[:, 2].abs()
             + 0.20 * end_herr_t
             + stasis_pen
@@ -1614,6 +1848,10 @@ def plan_explore_cmd(jepa, zc, latent_memory_norm, sm, robot_xy, robot_yaw, fron
             - 0.95 * frontier_t
             - novelty_bonus
         )
+        if depth_fwd_scale > 0.01:
+            cost = cost + cmds1[:, 0].clamp(min=0.0) * depth_fwd_scale * 7.5
+        if abs(depth_turn_bias) > 0.05:
+            cost = cost - depth_turn_bias * cmds1[:, 2]
 
         elite_k = max(8, cands // 10)
         elite = torch.topk(cost, k=elite_k, largest=False).indices
@@ -1662,33 +1900,34 @@ def _detection_los(sm, robot_xy, wp_pos, n_samples=20):
 
 
 @torch.no_grad()
-def check_detections(z_current, head, bc_lats, waypoints, robot_xy, found, seeking_idx,
+def check_detections(z_current, head, bc_lats, visible_candidates, found, seeking_idx,
                      seek_timeout_cd, glimpse_timeout_cd, detect_streaks, glimpse_streaks):
-    candidates: List[Tuple[int, float, float]] = []
+    candidates: List[Tuple[int, float, dict]] = []
     for i, z_goals in enumerate(bc_lats):
         if found[i] or i == seeking_idx or seek_timeout_cd[i] > 0 or glimpse_timeout_cd[i] > 0:
             detect_streaks[i] = 0
             glimpse_streaks[i] = 0
             continue
+        visible = visible_candidates.get(i)
+        if visible is None:
+            detect_streaks[i] = max(0, detect_streaks[i] - 1)
+            glimpse_streaks[i] = max(0, glimpse_streaks[i] - 1)
+            continue
         zc = z_current.expand(z_goals.shape[0], -1)
         e_min = float(head(zc, z_goals).min().item())
-        dist = float(np.linalg.norm(waypoints[i].pos - robot_xy))
-        candidates.append((i, e_min, dist))
+        candidates.append((i, e_min, visible))
 
     if not candidates:
         return None, None, None, None
 
-    candidates.sort(key=lambda x: x[1])
-    best_i, best_e, _ = candidates[0]
-    second_e = candidates[1][1] if len(candidates) > 1 else float("inf")
-
-    eligible: List[Tuple[int, float, float, float, int, str]] = []
-    for i, e_min, dist in candidates:
-        if e_min <= DETECT_ENERGY_THRESH:
+    eligible: List[Tuple[int, float, int, float, int, str, dict]] = []
+    for i, e_min, visible in candidates:
+        strong_visual = int(visible["pixels"]) >= VISIBLE_STRONG_PIXELS
+        if strong_visual or e_min <= DETECT_ENERGY_THRESH:
             detect_streaks[i] += 1
         else:
             detect_streaks[i] = max(0, detect_streaks[i] - 1)
-        if e_min <= GLIMPSE_ENERGY_THRESH:
+        if int(visible["pixels"]) >= VISIBLE_MIN_PIXELS or e_min <= GLIMPSE_ENERGY_THRESH:
             glimpse_streaks[i] += 1
         else:
             glimpse_streaks[i] = max(0, glimpse_streaks[i] - 1)
@@ -1701,16 +1940,25 @@ def check_detections(z_current, head, bc_lats, waypoints, robot_xy, found, seeki
         elif glimpse_streaks[i] >= GLIMPSE_CONFIRM_STEPS:
             kind = "glimpsed"
         if kind is not None:
-            score = e_min + DETECTION_SCORE_DIST_W * dist
-            eligible.append((kind_rank, score, dist, e_min, i, kind))
+            score = e_min - 0.06 * float(visible["pixels"]) - 0.30 * float(visible["density"])
+            eligible.append((
+                kind_rank,
+                score,
+                -int(visible["pixels"]),
+                float(abs(visible["bearing_rad"])),
+                i,
+                kind,
+                visible,
+            ))
 
     if eligible:
         eligible.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
-        _, _, _, chosen_e, chosen_i, chosen_kind = eligible[0]
+        _, _, _, _, chosen_i, chosen_kind, chosen_visible = eligible[0]
+        chosen_e = next(e for idx, e, _ in candidates if idx == chosen_i)
         detect_streaks[chosen_i] = 0
         glimpse_streaks[chosen_i] = 0
-        return chosen_i, chosen_e, second_e, chosen_kind
-    return None, best_e, second_e, None
+        return chosen_i, chosen_e, chosen_kind, chosen_visible
+    return None, None, None, None
 
 
 # --------------------------------------------------------------------------- #
@@ -1771,7 +2019,7 @@ def draw_minimap(draw, sm, robot_xy, robot_yaw, target_xy, trail, plan_path,
 def compose_frame(over_rgb, eye_rgb, sm, robot_xy, robot_yaw, target_xy,
                   trail, plan_path, waypoints, found, seeking_idx,
                   status_lines, event_log=None):
-    canvas = Image.new("RGB", (896, 660), (20, 20, 20))
+    canvas = Image.new("RGB", (896, 672), (20, 20, 20))
     draw   = ImageDraw.Draw(canvas)
 
     # ── Header ─────────────────────────────────────────────────── #
@@ -1804,14 +2052,14 @@ def compose_frame(over_rgb, eye_rgb, sm, robot_xy, robot_yaw, target_xy,
     canvas.paste(Image.fromarray(eye_rgb[:,:,:3].astype(np.uint8)).resize((384, 384)), (512, 56))
 
     # ── Right HUD panel (below eye view) ───────────────────────── #
-    draw.rectangle([512, 440, 895, 659], fill=(14, 14, 14), outline=(55, 55, 55))
+    draw.rectangle([512, 440, 895, 671], fill=(14, 14, 14), outline=(55, 55, 55))
     for i, line in enumerate(status_lines):
         draw.text((520, 447 + i * 16), line, fill=(200, 200, 200))
     draw_minimap(draw, sm, robot_xy, robot_yaw, target_xy, trail, plan_path,
                  waypoints, found, seeking_idx)
 
     # ── Event log (below overhead view) ────────────────────────── #
-    draw.rectangle([0, 568, 511, 659], fill=(14, 14, 14), outline=(55, 55, 55))
+    draw.rectangle([0, 568, 511, 671], fill=(14, 14, 14), outline=(55, 55, 55))
     draw.text((8, 572), "events", fill=(70, 70, 70))
     for i, (ev_type, ev_text) in enumerate((event_log or [])[-4:]):
         col = (255, 210, 60) if ev_type == "SPOTTED" else (80, 255, 120)
@@ -1867,12 +2115,6 @@ def main():
     else:
         dev = torch.device(args.device)
 
-    if dev.type == "cuda":
-        try:
-            torch.set_float32_matmul_precision("high")
-        except Exception:
-            pass
-
     print(f"Torch device: {dev}")
     if getattr(torch.version, "hip", None):
         print(f"PyTorch ROCm/HIP: {torch.version.hip}")
@@ -1899,24 +2141,30 @@ def main():
     ppo.eval()
     print(f"Loaded ActorCritic from {args.ppo_ckpt}")
 
-    # ── Build scene ───────────────────────────────────────────────────────  #
+    # ── Build generic reference latents (no maze teleports) ────────────── #
     waypoints = make_maze_waypoints()
-    scene, robot, cam_brain, cam_eye, cam_over, dofs, q0 = build_scene(waypoints)
-    print(f"Scene built: {len(waypoints)} hidden beacons, {len(MAZE_WALL_SPECS)} maze walls")
+    reference_waypoints = make_reference_waypoints(waypoints)
+    ref_scene, ref_robot, ref_cam_brain, ref_dofs, ref_q0 = build_reference_scene(reference_waypoints)
+    for _ in range(20):
+        ref_scene.step()
 
-    for _ in range(20): scene.step()
-
-    # ── Harvest breadcrumbs ───────────────────────────────────────────────  #
-    print("\nHarvesting latent breadcrumbs for each beacon ...")
+    print("\nHarvesting canonical beacon references ...")
     bc_dirs: List[np.ndarray]   = []
     bc_lats: List[torch.Tensor] = []
-    for i, wp in enumerate(waypoints):
-        print(f"  {wp.name}: {wp.pos}")
-        d, z = harvest_breadcrumb(robot, cam_brain, q0, jepa, ppo, dofs, dev, scene, wp)
+    for wp in reference_waypoints:
+        print(f"  {wp.name}: canonical panel")
+        d, z = harvest_breadcrumb(
+            ref_robot, ref_cam_brain, ref_q0, jepa, ppo, ref_dofs, dev, ref_scene, wp,
+        )
         bc_dirs.append(d)
         bc_lats.append(z)
 
-    # ── Reset — the harvest teleports shouldn't pre-build the wall map ────  #
+    # ── Build actual maze scene ─────────────────────────────────────────── #
+    scene, robot, cam_brain, cam_eye, cam_over, dofs, q0 = build_scene(waypoints)
+    print(f"Scene built: {len(waypoints)} hidden beacons, {len(MAZE_WALL_SPECS)} maze walls")
+    for _ in range(20):
+        scene.step()
+
     sm = make_sensor_map(args.map_res)
 
     robot.set_pos(np.array(ROBOT_SPAWN, np.float32))
@@ -1956,19 +2204,17 @@ def main():
     seek_start_dist  = 0.0  # d2g when seeking started
     seek_best_dist   = 0.0
     guard_trip_pos:   Deque[np.ndarray] = deque(maxlen=12)
-
-    # Hard long-stall escape: if robot hasn't moved far in a long window, force retreat.
-    LONG_STALL_WINDOW = 150
-    LONG_STALL_RADIUS = 0.30
     long_stall_pos: Deque[np.ndarray] = deque(maxlen=LONG_STALL_WINDOW)
+    long_stall_cov: Deque[float] = deque(maxlen=LONG_STALL_WINDOW)
+    long_stall_seek: Deque[float] = deque(maxlen=LONG_STALL_WINDOW)
+    last_long_stall_mode = "explore"
 
     frontier_xy       = np.array([0.5, 0.5], np.float32)
     frontier_age      = 0
     cov_start         = 0.0
-    FRONTIER_PATIENCE = 200
+    FRONTIER_PATIENCE = 90
     frontier_bl:      List[np.ndarray] = []
     frontier_switches = 0
-    guard_mode        = "none"
     guard_steps       = 0
     guard_cmd         = torch.zeros((1,3), device=dev)
     stuck_count       = 0
@@ -2003,32 +2249,8 @@ def main():
         if sample_cell(sm, robot_xy) == MAP_OCC and clip_retreat_steps <= 0:
             clip_retreat_steps = 20
 
-        # ── Hard long-stall escape: override everything if truly stuck ──── #
-        long_stall_pos.append(robot_xy.copy())
-        if (len(long_stall_pos) == long_stall_pos.maxlen
-                and float(np.linalg.norm(long_stall_pos[-1] - long_stall_pos[0])) < LONG_STALL_RADIUS):
-            # Force a large retreat in a random direction
-            escape_yaw = robot_yaw + math.pi + np.random.uniform(-0.8, 0.8)
-            escape_dir = np.array([math.cos(escape_yaw), math.sin(escape_yaw)], np.float32)
-            retreat_xy = np.clip(robot_xy + escape_dir * 1.5, WORLD_MIN + 0.3, WORLD_MAX - 0.3)
-            frontier_xy = retreat_xy.astype(np.float32)
-            frontier_age = 0; cov_start = cov if step > 0 else 0.0
-            frontier_bl.append(robot_xy.copy())
-            guard_cmd = torch.tensor([[-0.20, 0.0, float(np.random.choice([-0.75, 0.75]))]], device=dev, dtype=torch.float32)
-            guard_steps = 20
-            stuck_cooldown = 80
-            long_stall_pos.clear()
-            if seeking_idx >= 0:
-                seek_timeout_cd[seeking_idx] = max(seek_timeout_cd[seeking_idx], 90)
-                seeking_idx = -1
-                seek_best_dist = 0.0
-                seek_recent_pos.clear(); seek_recent_dist.clear(); seek_recent_sig.clear()
-            # Clear OCC around robot — camera may have clipped through wall
-            mark_disc(sm, robot_xy, 0.25, MAP_FREE)
-            print(f"\n  [LONG-STALL] Forced retreat at step {step}  pos=({robot_xy[0]:.2f},{robot_xy[1]:.2f})")
-
         # JEPA encode.
-        vis, prop, _, depth = get_jepa_state(robot, cam_brain, q0, prev_action, dofs, dev)
+        vis, prop, brain_rgb, depth = get_jepa_state(robot, cam_brain, q0, prev_action, dofs, dev)
         with torch.no_grad():
             z_current = jepa.encode_online(vis, prop).detach()
         if place_ema_latent is None:
@@ -2070,35 +2292,25 @@ def main():
         # ── Waypoint detection ─────────────────────────────────────────── #
         seek_timeout_cd = [max(0, c - 1) for c in seek_timeout_cd]
         glimpse_timeout_cd = [max(0, c - 1) for c in glimpse_timeout_cd]
+        visible_candidates = detect_visible_beacons(
+            brain_rgb,
+            depth,
+            args.depth_max,
+            waypoints,
+            cam_pitch_rad=cam_pitch,
+            cam_height_m=cam_height,
+            fov_deg=BRAIN_CAM_FOV_DEG,
+        )
         detected = None
         detect_e = None
-        detect_second_e = None
         detect_kind = None
+        detect_meta = None
         if (seeking_idx < 0 and clip_retreat_steps <= 0
                 and step % DETECT_STRIDE == 0):
-            detected, detect_e, detect_second_e, detect_kind = check_detections(
-                z_current, head, bc_lats, waypoints, robot_xy, found, seeking_idx,
+            detected, detect_e, detect_kind, detect_meta = check_detections(
+                z_current, head, bc_lats, visible_candidates, found, seeking_idx,
                 seek_timeout_cd, glimpse_timeout_cd, detect_streaks, glimpse_streaks,
             )
-            # Energy-head detections are trusted — no bearing or depth gate.
-            # The JEPA latent space can detect beacons from peripheral views
-            # and non-line-of-sight contexts that geometric gates would reject.
-
-            # Diagnostic: log energy values when near an unfound beacon
-            if step % 100 == 0:
-                for i, wp in enumerate(waypoints):
-                    if found[i] or i == seeking_idx:
-                        continue
-                    d2b = float(np.linalg.norm(wp.pos - robot_xy))
-                    if d2b < DETECT_DIST + 0.5:
-                        zc_diag = z_current.expand(bc_lats[i].shape[0], -1)
-                        e_diag = float(head(zc_diag, bc_lats[i]).min().item())
-                        bear = math.degrees(wrap_to_pi(
-                            math.atan2(float(wp.pos[1] - robot_xy[1]),
-                                       float(wp.pos[0] - robot_xy[0])) - robot_yaw))
-                        print(f"  [ENERGY-DIAG] {wp.name} d={d2b:.1f}m  E={e_diag:.2f}  bear={bear:.0f}°"
-                              f"  streak={glimpse_streaks[i]}  cd={glimpse_timeout_cd[i]}"
-                              f"  thr={GLIMPSE_ENERGY_THRESH}")
         if detected is not None and seeking_idx < 0:
             detect_wp = waypoints[detected]
             seek_goal_xy = waypoint_seek_anchor(detect_wp)
@@ -2106,8 +2318,10 @@ def main():
                 sm, robot_xy, seek_goal_xy, frontier_bl,
             )
             route_ready = seek_nav_xy is not None
-            dist_spotted = float(np.linalg.norm(detect_wp.pos - robot_xy))
-            if (route_ready and dist_spotted <= DETECTION_SEEK_MAX_DIST
+            seen_depth = None if detect_meta is None else detect_meta["depth_m"]
+            actionable = seen_depth is not None and seen_depth <= BEACON_ACTIONABLE_DEPTH
+            depth_str = "?" if seen_depth is None else f"{seen_depth:.2f}"
+            if (route_ready and actionable
                     and detect_kind in ("spotted", "glimpsed")):
                 seeking_idx    = detected
                 seek_steps     = 0
@@ -2120,32 +2334,35 @@ def main():
                 seek_recent_sig.clear()
                 seek_recovery_cd = 0
                 seek_stall_count = 0
-                seek_start_dist  = dist_spotted
-                seek_best_dist   = dist_spotted
+                seek_start_dist  = float(np.linalg.norm(seek_goal_xy - robot_xy))
+                seek_best_dist   = seek_start_dist
+                long_stall_pos.clear(); long_stall_cov.clear(); long_stall_seek.clear()
                 print(f"\n  [{detect_kind.upper()}] {detect_wp.name} at step {step}  "
-                      f"dist={dist_spotted:.2f}m  E={detect_e:.2f}")
+                      f"depth={depth_str}m  E={detect_e:.2f}")
                 event_log.append((
-                    detect_kind.upper(),
-                    f"step {step:4d}  {detect_kind.upper()} {detect_wp.name}  d={dist_spotted:.1f}m  E={detect_e:.2f}",
+                    "SPOTTED",
+                    f"step {step:4d}  SPOTTED {detect_wp.name}  z={depth_str}m  E={detect_e:.2f}",
                 ))
             else:
                 if seek_nav_xy is not None:
                     frontier_xy = seek_nav_xy.astype(np.float32)
                     frontier_age = 0
                     cov_start = cov
-                glimpse_timeout_cd[detected] = max(glimpse_timeout_cd[detected], GLIMPSE_COOLDOWN)
                 if not route_ready:
+                    glimpse_timeout_cd[detected] = max(glimpse_timeout_cd[detected], GLIMPSE_COOLDOWN)
                     seek_timeout_cd[detected] = max(seek_timeout_cd[detected], 30)
                     defer_reason = "known wall blocks route"
-                elif dist_spotted > DETECTION_SEEK_MAX_DIST:
-                    defer_reason = "too far for committed seek"
+                elif not actionable:
+                    glimpse_timeout_cd[detected] = max(glimpse_timeout_cd[detected], DETECT_STRIDE)
+                    defer_reason = "visible but not yet in depth range"
                 else:
+                    glimpse_timeout_cd[detected] = max(glimpse_timeout_cd[detected], 12)
                     defer_reason = "routing deferred"
-                print(f"\n  [GLIMPSED] {detect_wp.name} at step {step}  "
-                      f"dist={dist_spotted:.2f}m  E={detect_e:.2f}  — {defer_reason}")
+                print(f"\n  [SEEN] {detect_wp.name} at step {step}  "
+                      f"depth={depth_str}m  E={detect_e:.2f}  — {defer_reason}")
                 event_log.append((
-                    "GLIMPSED",
-                    f"step {step:4d}  GLIMPSED {detect_wp.name}  d={dist_spotted:.1f}m  E={detect_e:.2f}",
+                    "SEEN",
+                    f"step {step:4d}  SEEN {detect_wp.name}  z={depth_str}m  E={detect_e:.2f}",
                 ))
 
         # ── Goal-direction latent selection ────────────────────────────── #
@@ -2179,6 +2396,49 @@ def main():
             seek_recent_dist.clear()
             seek_recent_sig.clear()
             seek_recovery_cd = 0
+
+        # ── Hard long-stall escape: only fire when there is no real progress ── #
+        long_stall_mode = f"seek:{seeking_idx}" if seeking_idx >= 0 else "explore"
+        if (guard_steps > 0 or clip_retreat_steps > 0 or long_stall_mode != last_long_stall_mode):
+            long_stall_pos.clear()
+            long_stall_cov.clear()
+            long_stall_seek.clear()
+            last_long_stall_mode = long_stall_mode
+        else:
+            long_stall_pos.append(robot_xy.copy())
+            long_stall_cov.append(cov)
+            long_stall_seek.append(dist_to_seek if seeking_idx >= 0 else float("nan"))
+            if len(long_stall_pos) == long_stall_pos.maxlen:
+                net_disp = float(np.linalg.norm(long_stall_pos[-1] - long_stall_pos[0]))
+                cov_gain = float(long_stall_cov[-1] - long_stall_cov[0])
+                seek_gain = 0.0
+                if seeking_idx >= 0 and np.isfinite(long_stall_seek[0]) and np.isfinite(long_stall_seek[-1]):
+                    seek_gain = float(long_stall_seek[0] - long_stall_seek[-1])
+                if (net_disp < LONG_STALL_RADIUS
+                        and cov_gain < LONG_STALL_COV_GAIN
+                        and seek_gain < LONG_STALL_SEEK_PROGRESS):
+                    escape_yaw = robot_yaw + math.pi + np.random.uniform(-0.8, 0.8)
+                    escape_dir = np.array([math.cos(escape_yaw), math.sin(escape_yaw)], np.float32)
+                    retreat_xy = np.clip(robot_xy + escape_dir * 1.2, WORLD_MIN + 0.3, WORLD_MAX - 0.3)
+                    frontier_xy = retreat_xy.astype(np.float32)
+                    frontier_age = 0
+                    cov_start = cov
+                    frontier_bl.append(robot_xy.copy())
+                    guard_cmd = torch.tensor([[-0.20, 0.0, float(np.random.choice([-0.75, 0.75]))]], device=dev, dtype=torch.float32)
+                    guard_steps = 18
+                    stuck_cooldown = 80
+                    long_stall_pos.clear()
+                    long_stall_cov.clear()
+                    long_stall_seek.clear()
+                    if seeking_idx >= 0:
+                        seek_timeout_cd[seeking_idx] = max(seek_timeout_cd[seeking_idx], 90)
+                        seeking_idx = -1
+                        seek_best_dist = 0.0
+                        seek_recent_pos.clear()
+                        seek_recent_dist.clear()
+                        seek_recent_sig.clear()
+                    mark_disc(sm, robot_xy, 0.25, MAP_FREE)
+                    print(f"\n  [LONG-STALL] Forced retreat at step {step}  pos=({robot_xy[0]:.2f},{robot_xy[1]:.2f})")
 
         # ── Arrival check ──────────────────────────────────────────────── #
         if seeking_idx >= 0 and dist_to_seek < ARRIVE_DIST:
@@ -2250,11 +2510,6 @@ def main():
             seek_disp = float(np.linalg.norm(seek_recent_pos[-1] - seek_recent_pos[0]))
             seek_progress = float(seek_recent_dist[0] - seek_recent_dist[-1])
             sig_delta = 999.0
-            front_blocked = front_blocked_from_depth(
-                depth, args.depth_max,
-                cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
-                fov_deg=BRAIN_CAM_FOV_DEG,
-            )
             if len(seek_recent_sig) == seek_recent_sig.maxlen:
                 sig_delta = float(np.max(np.abs(seek_recent_sig[-1] - seek_recent_sig[0])))
             if (seek_disp < SEEK_STALL_DISP
@@ -2334,7 +2589,7 @@ def main():
                 seek_nav = seek_goal_xy
                 seek_nav_kind = "direct"
             nav_target = seek_nav
-            energy_scale = 1.0 if seek_nav_kind == "direct" else 0.45
+            energy_scale = 0.85 if seek_nav_kind == "direct" else 0.25
 
             navvec  = seek_nav - robot_xy
             navdist = float(np.linalg.norm(navvec))
@@ -2359,7 +2614,7 @@ def main():
                 frontier_bl.append(frontier_xy.copy())
                 frontier_age = 0; cov_start = cov
 
-            new_f, _ = select_frontier(sm, robot_xy, frontier_bl)
+            new_f, _ = select_explore_frontier(sm, robot_xy, frontier_bl)
             if not _frontier_reachable(sm, robot_xy, new_f):
                 reachable = None
                 best_score = float("-inf")
@@ -2403,6 +2658,7 @@ def main():
             cmd, plan_path = plan_explore_cmd(
                 jepa, z_current, latent_memory_norm, sm, robot_xy, robot_yaw,
                 nav_target, prev_cmd, args.cands, args.horizon, dev,
+                depth_sig=depth_sig,
             )
             prev_cmd = cmd.clone()
 
