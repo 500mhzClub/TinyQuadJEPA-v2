@@ -1897,6 +1897,11 @@ def main():
     seek_start_dist  = 0.0  # d2g when seeking started
     guard_trip_pos:   Deque[np.ndarray] = deque(maxlen=12)
 
+    # Hard long-stall escape: if robot hasn't moved far in a long window, force retreat.
+    LONG_STALL_WINDOW = 150
+    LONG_STALL_RADIUS = 0.30
+    long_stall_pos: Deque[np.ndarray] = deque(maxlen=LONG_STALL_WINDOW)
+
     frontier_xy       = np.array([0.5, 0.5], np.float32)
     frontier_age      = 0
     cov_start         = 0.0
@@ -1937,6 +1942,29 @@ def main():
         # ── Clip detection: physics has pushed robot into a perceived wall ─ #
         if sample_cell(sm, robot_xy) == MAP_OCC and clip_retreat_steps <= 0:
             clip_retreat_steps = 20
+
+        # ── Hard long-stall escape: override everything if truly stuck ──── #
+        long_stall_pos.append(robot_xy.copy())
+        if (len(long_stall_pos) == long_stall_pos.maxlen
+                and float(np.linalg.norm(long_stall_pos[-1] - long_stall_pos[0])) < LONG_STALL_RADIUS):
+            # Force a large retreat in a random direction
+            escape_yaw = robot_yaw + math.pi + np.random.uniform(-0.8, 0.8)
+            escape_dir = np.array([math.cos(escape_yaw), math.sin(escape_yaw)], np.float32)
+            retreat_xy = np.clip(robot_xy + escape_dir * 1.5, WORLD_MIN + 0.3, WORLD_MAX - 0.3)
+            frontier_xy = retreat_xy.astype(np.float32)
+            frontier_age = 0; cov_start = cov if step > 0 else 0.0
+            frontier_bl.append(robot_xy.copy())
+            guard_cmd = torch.tensor([[-0.20, 0.0, float(np.random.choice([-0.75, 0.75]))]], device=dev, dtype=torch.float32)
+            guard_steps = 20
+            stuck_cooldown = 80
+            long_stall_pos.clear()
+            if seeking_idx >= 0:
+                seek_timeout_cd[seeking_idx] = max(seek_timeout_cd[seeking_idx], 90)
+                seeking_idx = -1
+                seek_recent_pos.clear(); seek_recent_dist.clear(); seek_recent_sig.clear()
+            # Clear OCC around robot — camera may have clipped through wall
+            mark_disc(sm, robot_xy, 0.25, MAP_FREE)
+            print(f"\n  [LONG-STALL] Forced retreat at step {step}  pos=({robot_xy[0]:.2f},{robot_xy[1]:.2f})")
 
         # JEPA encode.
         vis, prop, _, depth = get_jepa_state(robot, cam_brain, q0, prev_action, dofs, dev)
@@ -1994,6 +2022,22 @@ def main():
             # Energy-head detections are trusted — no bearing or depth gate.
             # The JEPA latent space can detect beacons from peripheral views
             # and non-line-of-sight contexts that geometric gates would reject.
+
+            # Diagnostic: log energy values when near an unfound beacon
+            if step % 100 == 0:
+                for i, wp in enumerate(waypoints):
+                    if found[i] or i == seeking_idx:
+                        continue
+                    d2b = float(np.linalg.norm(wp.pos - robot_xy))
+                    if d2b < DETECT_DIST + 0.5:
+                        zc_diag = z_current.expand(bc_lats[i].shape[0], -1)
+                        e_diag = float(head(zc_diag, bc_lats[i]).min().item())
+                        bear = math.degrees(wrap_to_pi(
+                            math.atan2(float(wp.pos[1] - robot_xy[1]),
+                                       float(wp.pos[0] - robot_xy[0])) - robot_yaw))
+                        print(f"  [ENERGY-DIAG] {wp.name} d={d2b:.1f}m  E={e_diag:.2f}  bear={bear:.0f}°"
+                              f"  streak={glimpse_streaks[i]}  cd={glimpse_timeout_cd[i]}"
+                              f"  thr={GLIMPSE_ENERGY_THRESH}")
         if detected is not None and seeking_idx < 0:
             detect_wp = waypoints[detected]
             seek_goal_xy = waypoint_seek_anchor(detect_wp)
