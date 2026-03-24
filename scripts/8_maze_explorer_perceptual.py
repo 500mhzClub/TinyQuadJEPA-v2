@@ -114,8 +114,8 @@ ROBOT_CLEARANCE_RADIUS = 0.14   # conservative footprint used for LOS / reachabi
 FREE_RAY_CLEARANCE    = 0.12    # stop free carving before the depth hit
 OCC_INFLATION_RADIUS  = 0.08    # inflate perceived walls from depth only
 
-BRAIN_CAM_FWD_OFFSET = 0.01     # keep the brain camera well inside the body collision hull
-BRAIN_CAM_UP_OFFSET  = 0.09
+BRAIN_CAM_FWD_OFFSET = 0.10     # match the training/eval camera geometry
+BRAIN_CAM_UP_OFFSET  = 0.05
 BRAIN_CAM_FOV_DEG    = 58.0
 
 DEPTH_OCC_FLOOR_MARGIN_FRAC   = 0.04
