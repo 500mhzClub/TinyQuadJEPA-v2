@@ -123,7 +123,7 @@ FRONT_MAP_SAMPLE_RADIUS = 0.05
 FRONT_GUARD_CENTER_LO  = 0.42
 FRONT_GUARD_CENTER_HI  = 0.58
 SEEK_ANCHOR_OFFSET     = 0.35
-SEEK_STALL_WINDOW      = 28
+SEEK_STALL_WINDOW      = 55
 SEEK_STALL_DISP        = 0.05
 SEEK_STALL_PROGRESS    = 0.03
 SEEK_STALL_DEPTH_DELTA = 0.05
@@ -1390,7 +1390,7 @@ def plan_seek_cmd(
 
     for _ in range(5):
         cmds1 = mean + std * torch.randn((n_candidates,3), device=dev)
-        cmds1[:,0].clamp_(-vx_clamp, vx_clamp)
+        cmds1[:,0].clamp_(0.0, vx_clamp)
         cmds1[:,1].clamp_(-0.25, 0.25)
         cmds1[:,2].clamp_(-0.80, 0.80)
         cmds2 = mean2 + std2 * torch.randn((n_candidates,3), device=dev)
@@ -1787,7 +1787,7 @@ def main():
                         help="Torch device: auto | cuda | cpu.")
     parser.add_argument("--sim_backend", type=str, default="auto",
                         help="Genesis backend: auto | amdgpu | vulkan | gpu | cuda | metal | cpu.")
-    parser.add_argument("--n_steps",     type=int,   default=14000)
+    parser.add_argument("--n_steps",     type=int,   default=4000)
     parser.add_argument("--cands",       type=int,   default=512)
     parser.add_argument("--horizon",     type=int,   default=15)
     parser.add_argument("--map_res",     type=float, default=0.10)
@@ -2335,7 +2335,7 @@ def main():
                         guard_cmd = torch.tensor([[-0.15, 0.0,  0.60]], device=dev, dtype=torch.float32)
                 else:
                     guard_cmd = torch.tensor([[-0.15, 0.0, 0.55]], device=dev, dtype=torch.float32)
-                guard_steps = 14; stuck_cooldown = 45
+                guard_steps = 16; stuck_cooldown = 55
         else:
             if disp >= 0.12: stuck_count = max(0, stuck_count - 1)
 
@@ -2401,7 +2401,7 @@ def main():
                     cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
                     fov_deg=BRAIN_CAM_FOV_DEG,
                 )
-                guard_steps = 9 if seeking_idx >= 0 else 5
+                guard_steps = 12 if seeking_idx >= 0 else 8
                 guard_steps -= 1
                 if seeking_idx >= 0:
                     seek_recent_pos.clear()
