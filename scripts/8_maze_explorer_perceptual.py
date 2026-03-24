@@ -1677,20 +1677,23 @@ def main():
                 proxy_goal_xy is not None
                 and float(np.linalg.norm(proxy_goal_xy - seek_goal_xy)) <= PROXY_ROUTE_RADIUS
             )
+            # Allow routing through unknown cells — known walls still block.
+            # This lets the robot seek beacons in unexplored territory without
+            # falsely requiring the whole path to already be mapped free.
             route_ready = (
                 (
-                    sample_traversable_with_clearance(sm, seek_goal_xy, allow_unknown=False)
+                    sample_traversable_with_clearance(sm, seek_goal_xy, allow_unknown=True)
                     and (
-                        _frontier_reachable(sm, robot_xy, seek_goal_xy, allow_unknown=False)
+                        _frontier_reachable(sm, robot_xy, seek_goal_xy, allow_unknown=True)
                         or bfs_next_waypoint(sm, robot_xy, seek_goal_xy,
-                                             lookahead_m=0.7, allow_unknown=False,
+                                             lookahead_m=0.7, allow_unknown=True,
                                              snap_goal_to_free=False) is not None
                     )
                 )
                 or proxy_ready
             )
             dist_spotted = float(np.linalg.norm(detect_wp.pos - robot_xy))
-            if route_ready and detect_kind == "spotted":
+            if route_ready and detect_kind in ("spotted", "glimpsed"):
                 seeking_idx    = detected
                 seek_steps     = 0
                 seek_ema_e     = 4.0
@@ -1701,11 +1704,11 @@ def main():
                 seek_recent_dist.clear()
                 seek_recent_sig.clear()
                 seek_recovery_cd = 0
-                print(f"\n  [SPOTTED] {detect_wp.name} at step {step}  "
+                print(f"\n  [{detect_kind.upper()}] {detect_wp.name} at step {step}  "
                       f"dist={dist_spotted:.2f}m  E={detect_e:.2f}")
                 event_log.append((
-                    "SPOTTED",
-                    f"step {step:4d}  SPOTTED {detect_wp.name}  d={dist_spotted:.1f}m  E={detect_e:.2f}",
+                    detect_kind.upper(),
+                    f"step {step:4d}  {detect_kind.upper()} {detect_wp.name}  d={dist_spotted:.1f}m  E={detect_e:.2f}",
                 ))
             else:
                 if proxy_goal_xy is not None:
@@ -1715,7 +1718,7 @@ def main():
                 glimpse_timeout_cd[detected] = max(glimpse_timeout_cd[detected], GLIMPSE_COOLDOWN)
                 seek_timeout_cd[detected] = max(seek_timeout_cd[detected], 30)
                 print(f"\n  [GLIMPSED] {detect_wp.name} at step {step}  "
-                      f"dist={dist_spotted:.2f}m  E={detect_e:.2f}  — no free route yet")
+                      f"dist={dist_spotted:.2f}m  E={detect_e:.2f}  — no clear path (known wall blocks)")
                 event_log.append((
                     "GLIMPSED",
                     f"step {step:4d}  GLIMPSED {detect_wp.name}  d={dist_spotted:.1f}m  E={detect_e:.2f}",
