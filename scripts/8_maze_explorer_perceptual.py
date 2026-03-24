@@ -120,11 +120,11 @@ FRONT_MAP_SAMPLE_RADIUS = 0.05
 FRONT_GUARD_CENTER_LO  = 0.42
 FRONT_GUARD_CENTER_HI  = 0.58
 SEEK_ANCHOR_OFFSET     = 0.35
-SEEK_STALL_WINDOW      = 14
+SEEK_STALL_WINDOW      = 28
 SEEK_STALL_DISP        = 0.05
 SEEK_STALL_PROGRESS    = 0.03
 SEEK_STALL_DEPTH_DELTA = 0.05
-SEEK_RECOVERY_COOLDOWN = 18
+SEEK_RECOVERY_COOLDOWN = 30
 LINE_CHECK_STEP_M      = 0.05
 DETECTION_CLEARANCE_RADIUS = 0.08
 
@@ -1617,6 +1617,8 @@ def main():
     seek_recent_dist: Deque[float]      = deque(maxlen=SEEK_STALL_WINDOW)
     seek_recent_sig:  Deque[np.ndarray] = deque(maxlen=SEEK_STALL_WINDOW)
     seek_recovery_cd = 0
+    seek_stall_count = 0   # consecutive stalls without escaping
+    seek_start_dist  = 0.0  # d2g when seeking started
     guard_trip_pos:   Deque[np.ndarray] = deque(maxlen=12)
 
     frontier_xy       = np.array([0.5, 0.5], np.float32)
@@ -1704,6 +1706,25 @@ def main():
                 z_current, head, bc_lats, found, seeking_idx,
                 seek_timeout_cd, glimpse_timeout_cd, detect_streaks, glimpse_streaks,
             )
+            # Sanity-gate the detection:
+            # 1. Bearing gate — beacon must be within the camera FOV
+            # 2. Depth gate  — reject if there's a wall closer than the beacon
+            if detected is not None:
+                _dwp = waypoints[detected]
+                _d2b = float(np.linalg.norm(_dwp.pos - robot_xy))
+                _bear = math.atan2(float(_dwp.pos[1] - robot_xy[1]),
+                                   float(_dwp.pos[0] - robot_xy[0]))
+                _bear_err = abs(wrap_to_pi(_bear - robot_yaw))
+                _half_fov = math.radians(BRAIN_CAM_FOV_DEG / 2 + 12.0)  # 12° tolerance
+                _wall_blocking = (depth_sig is not None
+                                  and _d2b > 1.0
+                                  and float(depth_sig[1]) < _d2b * 0.55)
+                if _bear_err > _half_fov:
+                    print(f"  [DETECT-SKIP] {_dwp.name} bearing error={math.degrees(_bear_err):.0f}° > FOV")
+                    detected = None; detect_kind = None
+                elif _wall_blocking:
+                    print(f"  [DETECT-SKIP] {_dwp.name} wall blocks: dfwd={float(depth_sig[1]):.2f}m < d2b={_d2b:.2f}m")
+                    detected = None; detect_kind = None
         if detected is not None and seeking_idx < 0:
             detect_wp = waypoints[detected]
             seek_goal_xy = waypoint_seek_anchor(detect_wp)
@@ -1739,6 +1760,8 @@ def main():
                 seek_recent_dist.clear()
                 seek_recent_sig.clear()
                 seek_recovery_cd = 0
+                seek_stall_count = 0
+                seek_start_dist  = dist_spotted
                 print(f"\n  [{detect_kind.upper()}] {detect_wp.name} at step {step}  "
                       f"dist={dist_spotted:.2f}m  E={detect_e:.2f}")
                 event_log.append((
@@ -1875,6 +1898,7 @@ def main():
                     cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
                     fov_deg=BRAIN_CAM_FOV_DEG,
                 )
+                seek_stall_count += 1
                 guard_steps = 12
                 seek_steps = min(MAX_SEEK_STEPS, seek_steps + 35)
                 seek_recovery_cd = SEEK_RECOVERY_COOLDOWN
@@ -1883,12 +1907,38 @@ def main():
                 seek_recent_sig.clear()
                 print(f"\n  [SEEK-STALL] {waypoints[seeking_idx].name} at step {step}  "
                       f"disp={seek_disp:.2f}m  progress={seek_progress:.2f}m  "
-                      f"view={sig_delta:.3f} — backing off")
+                      f"view={sig_delta:.3f}  stalls={seek_stall_count} — backing off")
                 event_log.append((
                     "SEEK-STALL",
                     f"step {step:4d}  SEEK-STALL {waypoints[seeking_idx].name}  "
                     f"disp={seek_disp:.2f} progress={seek_progress:.2f}",
                 ))
+                # If we've stalled many times and haven't gotten closer, give up
+                if seek_stall_count >= 6:
+                    ab_idx = seeking_idx
+                    ab_wp  = waypoints[ab_idx]
+                    seek_fail_counts[ab_idx] += 1
+                    cooldown = min(360, 120 + 60 * (seek_fail_counts[ab_idx] - 1))
+                    print(f"\n  [SEEK-ABANDON] {ab_wp.name} at step {step}  "
+                          f"stalls={seek_stall_count}  start_dist={seek_start_dist:.2f}m — wall-blocked")
+                    seek_timeout_cd[ab_idx] = cooldown
+                    away = robot_xy - ab_wp.pos
+                    away_norm = float(np.linalg.norm(away))
+                    if away_norm > 1e-6:
+                        away = away / away_norm
+                    retreat_xy = np.clip(robot_xy + away * 2.0, WORLD_MIN + 0.3, WORLD_MAX - 0.3)
+                    frontier_xy = retreat_xy.astype(np.float32)
+                    frontier_age = 0; cov_start = cov
+                    seeking_idx = -1; prev_cmd = None
+                    guard_steps = 0
+                    seek_recent_pos.clear()
+                    seek_recent_dist.clear()
+                    seek_recent_sig.clear()
+                    seek_recovery_cd = 0
+                    event_log.append((
+                        "SEEK-ABANDON",
+                        f"step {step:4d}  SEEK-ABANDON {ab_wp.name}  stalls={seek_stall_count}",
+                    ))
 
         # ── Command selection ──────────────────────────────────────────── #
         energy_scale = 1.0  # updated inside seek branch; readable by log line
