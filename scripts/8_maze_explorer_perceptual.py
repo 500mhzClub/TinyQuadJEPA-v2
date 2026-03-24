@@ -1863,8 +1863,7 @@ def main():
             if len(seek_recent_sig) == seek_recent_sig.maxlen:
                 sig_delta = float(np.max(np.abs(seek_recent_sig[-1] - seek_recent_sig[0])))
             if (seek_disp < SEEK_STALL_DISP
-                    and seek_progress < SEEK_STALL_PROGRESS
-                    and sig_delta < SEEK_STALL_DEPTH_DELTA):
+                    and seek_progress < SEEK_STALL_PROGRESS):
                 reinforce_front_obstacle(
                     sm, robot_xy, robot_yaw, depth, args.depth_max,
                     cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
