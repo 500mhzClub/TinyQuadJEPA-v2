@@ -2147,7 +2147,8 @@ def main():
             if guard_steps > 0:
                 mode_dbg = f"GUARD({guard_steps})"
             elif seeking_idx >= 0:
-                mode_dbg = f"SEEK:{waypoints[seeking_idx].name}"
+                _d_fwd = f"  dfwd={float(depth_sig[1]):.2f}m" if depth_sig is not None else ""
+                mode_dbg = f"SEEK:{waypoints[seeking_idx].name}  d2g={dist_to_seek:.2f}m{_d_fwd}"
             else:
                 hdg_to_f = wrap_to_pi(
                     math.atan2(float(frontier_xy[1]-robot_xy[1]),
