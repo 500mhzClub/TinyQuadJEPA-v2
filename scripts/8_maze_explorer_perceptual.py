@@ -128,8 +128,11 @@ SEEK_STALL_DISP        = 0.05
 SEEK_STALL_PROGRESS    = 0.03
 SEEK_STALL_DEPTH_DELTA = 0.05
 SEEK_RECOVERY_COOLDOWN = 30
+SEEK_PROGRESS_RESET    = 0.10
 LINE_CHECK_STEP_M      = 0.05
 DETECTION_CLEARANCE_RADIUS = 0.08
+DETECTION_SCORE_DIST_W = 0.35
+DETECTION_SEEK_MAX_DIST = 3.20
 FREE_LOG_ODDS_DEC      = 2
 OCC_LOG_ODDS_INC       = 2
 LOG_ODDS_MIN           = -24
@@ -1036,6 +1039,50 @@ def select_goal_proxy(sm, robot_xy, goal_xy, blacklist=None, bl_radius=0.35):
     return best_wp
 
 
+def select_seek_nav_target(sm, robot_xy, goal_xy, blacklist=None):
+    """Immediate navigation target for a seek goal.
+
+    Prefers direct travel when the anchor is traversable, otherwise falls back
+    to an occupancy-guided BFS waypoint or a reachable proxy that still moves
+    toward the goal.
+    """
+    if _frontier_reachable(sm, robot_xy, goal_xy, allow_unknown=True):
+        return goal_xy.astype(np.float32), "direct"
+
+    options: List[Tuple[float, float, int, np.ndarray, str]] = []
+
+    bfs_wp = bfs_next_waypoint(
+        sm, robot_xy, goal_xy,
+        lookahead_m=0.7,
+        allow_unknown=True,
+        snap_goal_to_free=False,
+    )
+    if bfs_wp is not None:
+        options.append((
+            float(np.linalg.norm(goal_xy - bfs_wp)),
+            float(np.linalg.norm(robot_xy - bfs_wp)),
+            0,
+            bfs_wp.astype(np.float32),
+            "bfs",
+        ))
+
+    proxy_wp = select_goal_proxy(sm, robot_xy, goal_xy, blacklist=blacklist)
+    if proxy_wp is not None:
+        options.append((
+            float(np.linalg.norm(goal_xy - proxy_wp)),
+            float(np.linalg.norm(robot_xy - proxy_wp)),
+            1,
+            proxy_wp.astype(np.float32),
+            "proxy",
+        ))
+
+    if not options:
+        return None, None
+
+    options.sort(key=lambda x: (x[0], x[1], x[2]))
+    return options[0][3], options[0][4]
+
+
 # --------------------------------------------------------------------------- #
 # Kinematic rollout helpers
 # --------------------------------------------------------------------------- #
@@ -1615,9 +1662,9 @@ def _detection_los(sm, robot_xy, wp_pos, n_samples=20):
 
 
 @torch.no_grad()
-def check_detections(z_current, head, bc_lats, found, seeking_idx,
+def check_detections(z_current, head, bc_lats, waypoints, robot_xy, found, seeking_idx,
                      seek_timeout_cd, glimpse_timeout_cd, detect_streaks, glimpse_streaks):
-    candidates: List[Tuple[int, float]] = []
+    candidates: List[Tuple[int, float, float]] = []
     for i, z_goals in enumerate(bc_lats):
         if found[i] or i == seeking_idx or seek_timeout_cd[i] > 0 or glimpse_timeout_cd[i] > 0:
             detect_streaks[i] = 0
@@ -1625,32 +1672,44 @@ def check_detections(z_current, head, bc_lats, found, seeking_idx,
             continue
         zc = z_current.expand(z_goals.shape[0], -1)
         e_min = float(head(zc, z_goals).min().item())
-        candidates.append((i, e_min))
+        dist = float(np.linalg.norm(waypoints[i].pos - robot_xy))
+        candidates.append((i, e_min, dist))
 
     if not candidates:
         return None, None, None, None
 
     candidates.sort(key=lambda x: x[1])
-    best_i, best_e = candidates[0]
+    best_i, best_e, _ = candidates[0]
     second_e = candidates[1][1] if len(candidates) > 1 else float("inf")
 
-    for i, _ in candidates:
-        if i == best_i and best_e <= DETECT_ENERGY_THRESH and second_e >= best_e + DETECT_ENERGY_MARGIN:
+    eligible: List[Tuple[int, float, float, float, int, str]] = []
+    for i, e_min, dist in candidates:
+        if e_min <= DETECT_ENERGY_THRESH:
             detect_streaks[i] += 1
         else:
             detect_streaks[i] = max(0, detect_streaks[i] - 1)
-        if i == best_i and best_e <= GLIMPSE_ENERGY_THRESH and second_e >= best_e + GLIMPSE_ENERGY_MARGIN:
+        if e_min <= GLIMPSE_ENERGY_THRESH:
             glimpse_streaks[i] += 1
         else:
             glimpse_streaks[i] = max(0, glimpse_streaks[i] - 1)
 
-    if detect_streaks[best_i] >= DETECT_CONFIRM_STEPS:
-        detect_streaks[best_i] = 0
-        glimpse_streaks[best_i] = 0
-        return best_i, best_e, second_e, "spotted"
-    if glimpse_streaks[best_i] >= GLIMPSE_CONFIRM_STEPS:
-        glimpse_streaks[best_i] = 0
-        return best_i, best_e, second_e, "glimpsed"
+        kind = None
+        kind_rank = 1
+        if detect_streaks[i] >= DETECT_CONFIRM_STEPS:
+            kind = "spotted"
+            kind_rank = 0
+        elif glimpse_streaks[i] >= GLIMPSE_CONFIRM_STEPS:
+            kind = "glimpsed"
+        if kind is not None:
+            score = e_min + DETECTION_SCORE_DIST_W * dist
+            eligible.append((kind_rank, score, dist, e_min, i, kind))
+
+    if eligible:
+        eligible.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+        _, _, _, chosen_e, chosen_i, chosen_kind = eligible[0]
+        detect_streaks[chosen_i] = 0
+        glimpse_streaks[chosen_i] = 0
+        return chosen_i, chosen_e, second_e, chosen_kind
     return None, best_e, second_e, None
 
 
@@ -1895,6 +1954,7 @@ def main():
     seek_recovery_cd = 0
     seek_stall_count = 0   # consecutive stalls without escaping
     seek_start_dist  = 0.0  # d2g when seeking started
+    seek_best_dist   = 0.0
     guard_trip_pos:   Deque[np.ndarray] = deque(maxlen=12)
 
     # Hard long-stall escape: if robot hasn't moved far in a long window, force retreat.
@@ -1961,6 +2021,7 @@ def main():
             if seeking_idx >= 0:
                 seek_timeout_cd[seeking_idx] = max(seek_timeout_cd[seeking_idx], 90)
                 seeking_idx = -1
+                seek_best_dist = 0.0
                 seek_recent_pos.clear(); seek_recent_dist.clear(); seek_recent_sig.clear()
             # Clear OCC around robot — camera may have clipped through wall
             mark_disc(sm, robot_xy, 0.25, MAP_FREE)
@@ -2016,7 +2077,7 @@ def main():
         if (seeking_idx < 0 and clip_retreat_steps <= 0
                 and step % DETECT_STRIDE == 0):
             detected, detect_e, detect_second_e, detect_kind = check_detections(
-                z_current, head, bc_lats, found, seeking_idx,
+                z_current, head, bc_lats, waypoints, robot_xy, found, seeking_idx,
                 seek_timeout_cd, glimpse_timeout_cd, detect_streaks, glimpse_streaks,
             )
             # Energy-head detections are trusted — no bearing or depth gate.
@@ -2041,28 +2102,13 @@ def main():
         if detected is not None and seeking_idx < 0:
             detect_wp = waypoints[detected]
             seek_goal_xy = waypoint_seek_anchor(detect_wp)
-            proxy_goal_xy = select_goal_proxy(sm, robot_xy, seek_goal_xy, frontier_bl)
-            proxy_ready = (
-                proxy_goal_xy is not None
-                and float(np.linalg.norm(proxy_goal_xy - seek_goal_xy)) <= PROXY_ROUTE_RADIUS
+            seek_nav_xy, seek_nav_kind = select_seek_nav_target(
+                sm, robot_xy, seek_goal_xy, frontier_bl,
             )
-            # Allow routing through unknown cells — known walls still block.
-            # This lets the robot seek beacons in unexplored territory without
-            # falsely requiring the whole path to already be mapped free.
-            route_ready = (
-                (
-                    sample_traversable_with_clearance(sm, seek_goal_xy, allow_unknown=True)
-                    and (
-                        _frontier_reachable(sm, robot_xy, seek_goal_xy, allow_unknown=True)
-                        or bfs_next_waypoint(sm, robot_xy, seek_goal_xy,
-                                             lookahead_m=0.7, allow_unknown=True,
-                                             snap_goal_to_free=False) is not None
-                    )
-                )
-                or proxy_ready
-            )
+            route_ready = seek_nav_xy is not None
             dist_spotted = float(np.linalg.norm(detect_wp.pos - robot_xy))
-            if route_ready and detect_kind in ("spotted", "glimpsed"):
+            if (route_ready and dist_spotted <= DETECTION_SEEK_MAX_DIST
+                    and detect_kind in ("spotted", "glimpsed")):
                 seeking_idx    = detected
                 seek_steps     = 0
                 seek_ema_e     = 4.0
@@ -2075,6 +2121,7 @@ def main():
                 seek_recovery_cd = 0
                 seek_stall_count = 0
                 seek_start_dist  = dist_spotted
+                seek_best_dist   = dist_spotted
                 print(f"\n  [{detect_kind.upper()}] {detect_wp.name} at step {step}  "
                       f"dist={dist_spotted:.2f}m  E={detect_e:.2f}")
                 event_log.append((
@@ -2082,14 +2129,20 @@ def main():
                     f"step {step:4d}  {detect_kind.upper()} {detect_wp.name}  d={dist_spotted:.1f}m  E={detect_e:.2f}",
                 ))
             else:
-                if proxy_goal_xy is not None:
-                    frontier_xy = proxy_goal_xy.astype(np.float32)
+                if seek_nav_xy is not None:
+                    frontier_xy = seek_nav_xy.astype(np.float32)
                     frontier_age = 0
                     cov_start = cov
                 glimpse_timeout_cd[detected] = max(glimpse_timeout_cd[detected], GLIMPSE_COOLDOWN)
-                seek_timeout_cd[detected] = max(seek_timeout_cd[detected], 30)
+                if not route_ready:
+                    seek_timeout_cd[detected] = max(seek_timeout_cd[detected], 30)
+                    defer_reason = "known wall blocks route"
+                elif dist_spotted > DETECTION_SEEK_MAX_DIST:
+                    defer_reason = "too far for committed seek"
+                else:
+                    defer_reason = "routing deferred"
                 print(f"\n  [GLIMPSED] {detect_wp.name} at step {step}  "
-                      f"dist={dist_spotted:.2f}m  E={detect_e:.2f}  — no clear path (known wall blocks)")
+                      f"dist={dist_spotted:.2f}m  E={detect_e:.2f}  — {defer_reason}")
                 event_log.append((
                     "GLIMPSED",
                     f"step {step:4d}  GLIMPSED {detect_wp.name}  d={dist_spotted:.1f}m  E={detect_e:.2f}",
@@ -2108,6 +2161,10 @@ def main():
                 raw_e = float(head(z_current, z_goal).item())
             seek_ema_e = 0.30*raw_e + 0.70*seek_ema_e
             dist_to_seek = float(gv_norm)
+            if dist_to_seek + 1e-4 < seek_best_dist:
+                if seek_best_dist - dist_to_seek >= SEEK_PROGRESS_RESET:
+                    seek_stall_count = 0
+                seek_best_dist = dist_to_seek
         else:
             dist_to_seek = 999.0
             raw_e = 0.0
@@ -2138,6 +2195,7 @@ def main():
             event_log.append(("CLAIMED",
                                f"step {step:4d}  CLAIMED {wp.name}  ({n_found}/{len(waypoints)})"))
             seeking_idx = -1; prev_cmd = None
+            seek_best_dist = 0.0
             seek_recent_pos.clear()
             seek_recent_dist.clear()
             seek_recent_sig.clear()
@@ -2176,6 +2234,7 @@ def main():
                 frontier_xy = retreat_xy.astype(np.float32)
                 frontier_age = 0; cov_start = cov
                 seeking_idx = -1; prev_cmd = None
+                seek_best_dist = 0.0
                 seek_recent_pos.clear()
                 seek_recent_dist.clear()
                 seek_recent_sig.clear()
@@ -2243,6 +2302,7 @@ def main():
                     frontier_xy = retreat_xy.astype(np.float32)
                     frontier_age = 0; cov_start = cov
                     seeking_idx = -1; prev_cmd = None
+                    seek_best_dist = 0.0
                     guard_steps = 0
                     seek_recent_pos.clear()
                     seek_recent_dist.clear()
@@ -2262,13 +2322,19 @@ def main():
             cmd = guard_cmd; guard_steps -= 1; plan_path = None
         elif seeking_idx >= 0:
             # Goal-directed: JEPA energy + depth-based obstacle avoidance.
-            # No BFS — the world model guides direction; the depth penalty
-            # in plan_seek_cmd stops the robot from driving into walls the
-            # camera sees but that may not yet be in the occupancy map.
+            # Keep a routeable navigation waypoint while seeking so the robot
+            # can progress around perceived walls instead of repeatedly pushing
+            # straight at an occluded beacon anchor.
             wp    = waypoints[seeking_idx]
             seek_goal_xy = waypoint_seek_anchor(wp)
-            seek_nav = seek_goal_xy
-            energy_scale = 1.0
+            seek_nav, seek_nav_kind = select_seek_nav_target(
+                sm, robot_xy, seek_goal_xy, frontier_bl,
+            )
+            if seek_nav is None:
+                seek_nav = seek_goal_xy
+                seek_nav_kind = "direct"
+            nav_target = seek_nav
+            energy_scale = 1.0 if seek_nav_kind == "direct" else 0.45
 
             navvec  = seek_nav - robot_xy
             navdist = float(np.linalg.norm(navvec))
@@ -2474,6 +2540,7 @@ def main():
                     if seeking_idx >= 0:
                         seek_timeout_cd[seeking_idx] = max(seek_timeout_cd[seeking_idx], 60)
                         seeking_idx = -1
+                        seek_best_dist = 0.0
                         seek_recent_pos.clear()
                         seek_recent_dist.clear()
                         seek_recent_sig.clear()
@@ -2517,7 +2584,10 @@ def main():
                 mode_dbg = f"GUARD({guard_steps})"
             elif seeking_idx >= 0:
                 _d_fwd = f"  dfwd={float(depth_sig[1]):.2f}m" if depth_sig is not None else ""
-                mode_dbg = f"SEEK:{waypoints[seeking_idx].name}  d2g={dist_to_seek:.2f}m{_d_fwd}"
+                seek_goal_xy = waypoint_seek_anchor(waypoints[seeking_idx])
+                via_str = (f"  via=({nav_target[0]:.2f},{nav_target[1]:.2f})"
+                           if float(np.linalg.norm(nav_target - seek_goal_xy)) > 0.15 else "")
+                mode_dbg = f"SEEK:{waypoints[seeking_idx].name}  d2g={dist_to_seek:.2f}m{_d_fwd}{via_str}"
             else:
                 hdg_to_f = wrap_to_pi(
                     math.atan2(float(frontier_xy[1]-robot_xy[1]),
