@@ -107,7 +107,7 @@ MIN_OCC_DEPTH   = 0.25  # ignore depth endpoints closer than this (body / feet)
 ROBOT_SELF_FREE_RADIUS = 0.08   # don't erase nearby walls with an oversized free bubble
 ROBOT_CLEARANCE_RADIUS = 0.14   # conservative footprint used for LOS / reachability tests
 FREE_RAY_CLEARANCE    = 0.12    # stop free carving before the depth hit
-OCC_INFLATION_RADIUS  = 0.12    # inflate perceived walls from depth only
+OCC_INFLATION_RADIUS  = 0.08    # inflate perceived walls from depth only
 
 BRAIN_CAM_FWD_OFFSET = 0.01     # keep the brain camera well inside the body collision hull
 BRAIN_CAM_UP_OFFSET  = 0.09
@@ -130,14 +130,14 @@ SEEK_STALL_DEPTH_DELTA = 0.05
 SEEK_RECOVERY_COOLDOWN = 30
 LINE_CHECK_STEP_M      = 0.05
 DETECTION_CLEARANCE_RADIUS = 0.08
-FREE_LOG_ODDS_DEC      = 1
-OCC_LOG_ODDS_INC       = 4
+FREE_LOG_ODDS_DEC      = 2
+OCC_LOG_ODDS_INC       = 2
 LOG_ODDS_MIN           = -24
 LOG_ODDS_MAX           = 24
-LOG_ODDS_OCC_THRESH    = 6
+LOG_ODDS_OCC_THRESH    = 10
 LOG_ODDS_FREE_THRESH   = -2
 OCC_HIT_CLUSTER_EPS_M  = 0.10
-OCC_HIT_MIN_ROWS       = 3
+OCC_HIT_MIN_ROWS       = 4
 OCC_HIT_MIN_FRAC       = 0.16
 DETECT_WALL_MARGIN_M   = 0.18
 UNKNOWN_TRAVERSE_COST  = 2.6
@@ -1956,7 +1956,7 @@ def main():
                                    float(_dwp.pos[0] - robot_xy[0]))
                 _bear_delta = wrap_to_pi(_bear - robot_yaw)
                 _bear_err = abs(_bear_delta)
-                _half_fov = math.radians(BRAIN_CAM_FOV_DEG / 2 + 12.0)  # 12° tolerance
+                _half_fov = math.radians(BRAIN_CAM_FOV_DEG / 2 + 25.0)  # 25° tolerance — allow peripheral/latent detections
                 _bearing_stats = bearing_depth_stats(
                     depth, _bear_delta, args.depth_max,
                     cam_pitch_rad=cam_pitch, cam_height_m=cam_height,
