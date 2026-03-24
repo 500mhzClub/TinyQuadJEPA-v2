@@ -1864,64 +1864,36 @@ def main():
         elif guard_steps > 0:
             cmd = guard_cmd; guard_steps -= 1; plan_path = None
         elif seeking_idx >= 0:
-            # Goal-directed with BFS routing when direct path is wall-blocked.
+            # Goal-directed: BFS detours only around *known* walls; JEPA CEM
+            # handles the rest (arcing around corners, unknown space, etc.).
             wp    = waypoints[seeking_idx]
             seek_goal_xy = waypoint_seek_anchor(wp)
             gvec  = seek_goal_xy - robot_xy
             gdist = float(np.linalg.norm(gvec))
-            use_seek_planner = True
 
-            if not _frontier_reachable(sm, robot_xy, seek_goal_xy, allow_unknown=False):
-                bfs_tgt  = bfs_next_waypoint(
+            # allow_unknown=True so unexplored space is treated as passable;
+            # only a confirmed MAP_OCC cell triggers a BFS detour.
+            if not _frontier_reachable(sm, robot_xy, seek_goal_xy, allow_unknown=True):
+                bfs_tgt = bfs_next_waypoint(
                     sm, robot_xy, seek_goal_xy,
-                    lookahead_m=0.7, allow_unknown=False, snap_goal_to_free=False,
+                    lookahead_m=0.7, allow_unknown=True, snap_goal_to_free=False,
                 )
-                if bfs_tgt is not None:
-                    seek_nav = bfs_tgt
-                else:
-                    proxy_tgt = select_goal_proxy(sm, robot_xy, seek_goal_xy, frontier_bl)
-                    if proxy_tgt is not None:
-                        seek_nav = proxy_tgt
-                        use_seek_planner = False
-                    else:
-                        seek_timeout_cd[seeking_idx] = max(seek_timeout_cd[seeking_idx], 45)
-                        seeking_idx = -1
-                        prev_cmd = None
-                        seek_recent_pos.clear()
-                        seek_recent_dist.clear()
-                        seek_recent_sig.clear()
-                        seek_recovery_cd = 0
-                        nav_target = frontier_xy
-                        cmd, plan_path = plan_explore_cmd(
-                            jepa, z_current, latent_memory_norm, sm,
-                            robot_xy, robot_yaw, nav_target, prev_cmd,
-                            args.cands, args.horizon, dev,
-                        )
-                        prev_cmd = cmd.clone()
-                        use_seek_planner = None
+                seek_nav = bfs_tgt if bfs_tgt is not None else seek_goal_xy
             else:
                 seek_nav = seek_goal_xy
 
-            if use_seek_planner is not None:
-                navvec  = seek_nav - robot_xy
-                navdist = float(np.linalg.norm(navvec))
-                navdir  = navvec / max(navdist, 1e-8)
-                gbody   = world_to_body_xy(robot_yaw, navdir)
-                gang    = math.atan2(float(navvec[1]), float(navvec[0]))
-                herr    = wrap_to_pi(gang - robot_yaw)
-                if use_seek_planner:
-                    cmd, plan_path = plan_seek_cmd(
-                        jepa, head, z_current, z_goal, sm,
-                        robot_xy, robot_yaw, seek_nav, gbody,
-                        navdist, herr, args.cands, args.horizon, dev, prev_cmd,
-                    )
-                else:
-                    cmd, plan_path = plan_explore_cmd(
-                        jepa, z_current, latent_memory_norm, sm,
-                        robot_xy, robot_yaw, seek_nav, prev_cmd,
-                        args.cands, args.horizon, dev,
-                    )
-                prev_cmd = cmd.clone()
+            navvec  = seek_nav - robot_xy
+            navdist = float(np.linalg.norm(navvec))
+            navdir  = navvec / max(navdist, 1e-8)
+            gbody   = world_to_body_xy(robot_yaw, navdir)
+            gang    = math.atan2(float(navvec[1]), float(navvec[0]))
+            herr    = wrap_to_pi(gang - robot_yaw)
+            cmd, plan_path = plan_seek_cmd(
+                jepa, head, z_current, z_goal, sm,
+                robot_xy, robot_yaw, seek_nav, gbody,
+                navdist, herr, args.cands, args.horizon, dev, prev_cmd,
+            )
+            prev_cmd = cmd.clone()
         else:
             # Frontier exploration.
             frontier_age += 1
